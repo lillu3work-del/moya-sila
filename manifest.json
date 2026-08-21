@@ -1,0 +1,14 @@
+{
+  "name": "Моя сила",
+  "short_name": "Моя сила",
+  "description": "Тренировка, в которой всё понятно",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0a0b0f",
+  "theme_color": "#0a0b0f",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
