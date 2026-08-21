@@ -8,8 +8,13 @@ const STORAGE_LOG = "moya-sila-log-v2";
 const STORAGE_VIBE = "moya-sila-vibe-v1";
 const STORAGE_CALENDAR = "moya-sila-calendar-v1";
 const STORAGE_RIR_SEEN = "moya-sila-rir-seen-v1";
+const STORAGE_UNDO = "moya-sila-undo-v1";
 
-const ALL_STORAGE_KEYS = [STORAGE_MODE, STORAGE_SESSION, STORAGE_STATUS, STORAGE_HISTORY, STORAGE_LOG, STORAGE_VIBE, STORAGE_CALENDAR, "moya-sila-rotation-v1", "moya-sila-last-by-letter-v1"];
+const ALL_STORAGE_KEYS = [STORAGE_MODE, STORAGE_SESSION, STORAGE_STATUS, STORAGE_HISTORY, STORAGE_LOG, STORAGE_VIBE, STORAGE_CALENDAR, STORAGE_UNDO, "moya-sila-rotation-v1", "moya-sila-last-by-letter-v1"];
+
+function makeId() {
+  return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+}
 
 function dateKey(d) {
   const y = d.getFullYear();
@@ -43,6 +48,9 @@ const state = {
   history: loadJSON(STORAGE_HISTORY, {}), // exerciseId -> [{date, weight, reps}]
   log: loadJSON(STORAGE_LOG, []),
   calendar: loadJSON(STORAGE_CALENDAR, {}), // dateKey -> {type: 'session'|'cardio'|'other'|'rest', letter?}
+  lastUndo: loadJSON(STORAGE_UNDO, null),
+  view: "workout", // 'workout' | 'history' | 'report'
+  reportId: null,
   expanded: null,
   swapOpenKey: null,
   calendarOpenDay: null,
@@ -118,38 +126,76 @@ function applySwap(group, index, newId) {
   render();
 }
 
-function changeMode(mode) {
-  state.mode = mode;
-  saveJSON(STORAGE_MODE, mode);
-  state.session = generateSession(state.session.letter, mode, state.vibe);
+// ⟳ рядом с копированием — мгновенная автозамена на следующий вариант по кругу,
+// без открытия списка (список открывается отдельно через "Заменить упражнение →").
+function quickSwap(group, index) {
+  const row = getRow(group, index);
+  const isPrepSlot = group === "warmup" || group === "cooldown";
+  const options = getSwapOptions(row.id, row.originalId, isPrepSlot);
+  if (options.length < 2) return;
+  const ids = options.map((o) => o.id);
+  const curIdx = ids.indexOf(row.id);
+  const nextId = ids[(curIdx + 1) % ids.length];
+  row.id = nextId;
   saveJSON(STORAGE_SESSION, state.session);
-  state.status = {};
-  saveJSON(STORAGE_STATUS, state.status);
-  state.expanded = null;
-  state.swapOpenKey = null;
   render();
+}
+
+function changeMode(mode) {
+  withTransition(() => {
+    state.mode = mode;
+    saveJSON(STORAGE_MODE, mode);
+    state.session = generateSession(state.session.letter, mode, state.vibe);
+    saveJSON(STORAGE_SESSION, state.session);
+    state.status = {};
+    saveJSON(STORAGE_STATUS, state.status);
+    state.expanded = null;
+    state.swapOpenKey = null;
+    render();
+  });
 }
 
 function switchDay(letter) {
-  state.session = generateSession(letter, state.mode, state.vibe);
-  saveJSON(STORAGE_SESSION, state.session);
-  state.status = {};
-  saveJSON(STORAGE_STATUS, state.status);
-  state.expanded = null;
-  state.swapOpenKey = null;
-  render();
+  withTransition(() => {
+    state.session = generateSession(letter, state.mode, state.vibe);
+    saveJSON(STORAGE_SESSION, state.session);
+    state.status = {};
+    saveJSON(STORAGE_STATUS, state.status);
+    state.expanded = null;
+    state.swapOpenKey = null;
+    render();
+  });
 }
 
 function changeVibe(vibe) {
-  state.vibe = vibe;
-  saveVibeState({ current: vibe });
-  state.session = generateSession(state.session.letter, state.mode, vibe);
-  saveJSON(STORAGE_SESSION, state.session);
-  state.status = {};
-  saveJSON(STORAGE_STATUS, state.status);
-  state.expanded = null;
-  state.swapOpenKey = null;
+  withTransition(() => {
+    state.vibe = vibe;
+    saveVibeState({ current: vibe });
+    state.session = generateSession(state.session.letter, state.mode, vibe);
+    saveJSON(STORAGE_SESSION, state.session);
+    state.status = {};
+    saveJSON(STORAGE_STATUS, state.status);
+    state.expanded = null;
+    state.swapOpenKey = null;
+    render();
+  });
+}
+
+// ---------- ЭКРАНЫ (Тренировка / История / Отчёт) ----------
+
+function showView(view) {
+  state.view = view;
+  ["view-workout", "view-history", "view-report"].forEach((id) => {
+    const el2 = document.getElementById(id);
+    if (el2) el2.classList.toggle("hidden", id !== `view-${view}`);
+  });
   render();
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+function openReport(id) {
+  state.reportId = id;
+  showView("report");
 }
 
 function setCalendarDay(key, type) {
@@ -160,13 +206,55 @@ function setCalendarDay(key, type) {
   render();
 }
 
+// Полный слепок тренировки для отчёта: что было в каждом блоке, отмечено ли,
+// и какой вес/повторы записаны именно сегодня (чтобы отчёт не тянул старые записи).
+function snapshotSessionExercises() {
+  const todayKey = dateKey(new Date());
+  const out = [];
+  BLOCKS.forEach((b) => {
+    (state.session[b.group] || []).forEach((row, i) => {
+      const exercise = EXERCISES[row.id];
+      const key = slotKey(b.group, i);
+      const last = lastLog(row.id);
+      const loggedToday = last && dateKey(new Date(last.date)) === todayKey ? last : null;
+      out.push({
+        id: row.id,
+        name: exercise.nameEn,
+        block: b.group,
+        blockTitle: b.title,
+        slotTitle: row.slotTitle,
+        status: state.status[key] || null,
+        weight: loggedToday ? loggedToday.weight : "",
+        reps: loggedToday ? loggedToday.reps : "",
+      });
+    });
+  });
+  return out;
+}
+
 function finishSession() {
   const rows = allTrackableRows();
   const doneCount = rows.filter((r) => state.status[slotKey(r.group, r.index)] === "done").length;
   const skippedCount = rows.filter((r) => state.status[slotKey(r.group, r.index)] === "skipped").length;
   const note = (document.getElementById("session-note").value || "").trim();
+  const todayKey = dateKey(new Date());
+  const exercisesSnapshot = snapshotSessionExercises();
 
+  // Снэпшот всего, что мы сейчас поменяем — чтобы можно было одним тапом откатить,
+  // если "Готово" нажали случайно или слишком рано.
+  const undoSnapshot = {
+    session: state.session,
+    status: state.status,
+    rotationNext: rotation.next,
+    rotationHistory: rotation.history.slice(),
+    vibe: state.vibe,
+    calendarKey: todayKey,
+    previousCalendarEntry: state.calendar[todayKey] || null,
+  };
+
+  const logId = makeId();
   state.log.push({
+    id: logId,
     date: new Date().toISOString(),
     letter: state.session.letter,
     label: state.session.label,
@@ -176,10 +264,12 @@ function finishSession() {
     done: doneCount,
     skipped: skippedCount,
     note,
+    exercises: exercisesSnapshot,
   });
   saveJSON(STORAGE_LOG, state.log);
+  undoSnapshot.logId = logId;
 
-  state.calendar[dateKey(new Date())] = { type: "session", letter: state.session.letter };
+  state.calendar[todayKey] = { type: "session", letter: state.session.letter };
   saveJSON(STORAGE_CALENDAR, state.calendar);
 
   rotation.history.push(state.session.letter);
@@ -196,9 +286,96 @@ function finishSession() {
   state.expanded = null;
   state.swapOpenKey = null;
   document.getElementById("session-note").value = "";
+
+  state.lastUndo = undoSnapshot;
+  saveJSON(STORAGE_UNDO, undoSnapshot);
+
   render();
   window.scrollTo({ top: 0, behavior: "smooth" });
-  showCelebration();
+  showCelebration({ done: doneCount, total: rows.length, letter: undoSnapshot.session.letter, streak: calculateStreak() });
+}
+
+// Сколько дней подряд (включая сегодня) есть хоть какая-то отметка в календаре.
+function calculateStreak() {
+  let streak = 0;
+  const d = new Date();
+  while (true) {
+    const key = dateKey(d);
+    if (!state.calendar[key]) break;
+    streak += 1;
+    d.setDate(d.getDate() - 1);
+  }
+  return streak;
+}
+
+function undoLastFinish() {
+  const snap = state.lastUndo;
+  if (!snap) return;
+  if (!window.confirm("Отменить последнее завершение и вернуться к той тренировке?")) return;
+
+  const idx = state.log.findIndex((e) => e.id === snap.logId);
+  if (idx !== -1) state.log.splice(idx, 1);
+  saveJSON(STORAGE_LOG, state.log);
+
+  if (snap.previousCalendarEntry) state.calendar[snap.calendarKey] = snap.previousCalendarEntry;
+  else delete state.calendar[snap.calendarKey];
+  saveJSON(STORAGE_CALENDAR, state.calendar);
+
+  rotation.next = snap.rotationNext;
+  rotation.history = snap.rotationHistory;
+  saveRotationState(rotation);
+
+  state.vibe = snap.vibe;
+  saveVibeState({ current: state.vibe });
+
+  state.session = snap.session;
+  saveJSON(STORAGE_SESSION, state.session);
+  state.status = snap.status;
+  saveJSON(STORAGE_STATUS, state.status);
+
+  state.lastUndo = null;
+  localStorage.removeItem(STORAGE_UNDO);
+
+  state.expanded = null;
+  state.swapOpenKey = null;
+  render();
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+function dismissUndo() {
+  state.lastUndo = null;
+  localStorage.removeItem(STORAGE_UNDO);
+  render();
+}
+
+function deleteHistoryEntry(id) {
+  if (!window.confirm("Удалить эту запись из истории?")) return;
+  const idx = state.log.findIndex((e) => e.id === id);
+  if (idx === -1) return;
+  const entry = state.log[idx];
+  state.log.splice(idx, 1);
+  saveJSON(STORAGE_LOG, state.log);
+
+  const key = dateKey(new Date(entry.date));
+  const calEntry = state.calendar[key];
+  if (calEntry && calEntry.type === "session" && calEntry.letter === entry.letter) {
+    const stillHasSessionThatDay = state.log.some((e) => dateKey(new Date(e.date)) === key);
+    if (!stillHasSessionThatDay) delete state.calendar[key];
+    saveJSON(STORAGE_CALENDAR, state.calendar);
+  }
+
+  if (state.lastUndo && state.lastUndo.logId === id) {
+    state.lastUndo = null;
+    localStorage.removeItem(STORAGE_UNDO);
+  }
+  render();
+}
+
+function updateHistoryNote(id, note) {
+  const entry = state.log.find((e) => e.id === id);
+  if (!entry) return;
+  entry.note = note;
+  saveJSON(STORAGE_LOG, state.log);
 }
 
 const FINISH_QUOTES = [
@@ -210,9 +387,40 @@ const FINISH_QUOTES = [
   "Маленький шаг, которого не было бы без тебя сегодня.",
   "Сложно было встать — но ты встала. Остальное было делом техники.",
   "Прогресс редко выглядит эффектно. Обычно он выглядит вот так.",
+  "Никто не видел, но это было. И это главное.",
+  "Сегодняшняя тренировка — это письмо будущей тебе. Хорошее письмо.",
+  "Дисциплина — это не про настроение. Настроения не было, а тренировка есть.",
+  "Ты не обязана была сегодня. Но ты выбрала. Это разница.",
+  "Форма меняется не на одной тренировке — а на том, что ты не бросила счёт.",
+  "Сравни себя только с собой месяц назад. Разница уже есть.",
+  "Это была не самая простая тренировка недели — и ты её закрыла.",
+  "Пока ты сомневалась, стоит ли — тело уже работало. Красиво вышло.",
+  "Пот высохнет, а результат останется.",
+  "Ты не должна чувствовать себя великой каждый раз. Достаточно, что ты пришла.",
+  "Пусть это будет ещё одна причина гордиться собой сегодня вечером.",
+  "Настоящая сила — прийти, даже когда не хочется. Ты пришла.",
+  "Каждая тренировка — вклад, который не сгорает.",
+  "Это была не гонка с кем-то. Это была встреча с собой. Она состоялась.",
 ];
 
-function showCelebration() {
+function pickFinishQuote(stats) {
+  const dynamic = [];
+  if (stats.total > 0) {
+    if (stats.done === stats.total) {
+      dynamic.push(`Сделано всё до единого — ${stats.done} из ${stats.total}. Сегодня ты выложилась полностью.`);
+    } else if (stats.done > 0) {
+      dynamic.push(`${stats.done} из ${stats.total} — не всё, но реально сделано, а не просто задумано.`);
+    }
+  }
+  dynamic.push(`Тренировка «${stats.letter}» закрыта. Следующая по очереди будет другой — и это тоже часть плана.`);
+  if (stats.streak >= 2) dynamic.push(`Это уже ${stats.streak}-й день подряд с активностью. Ты держишь ритм.`);
+
+  const useDynamic = dynamic.length && Math.random() < 0.45;
+  const pool = useDynamic ? dynamic : FINISH_QUOTES;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+function showCelebration(stats) {
   const overlay = document.createElement("div");
   overlay.className = "celebrate-overlay";
   const emojis = ["✨", "🔥", "💪", "🌟", "🎉", "🩷"];
@@ -225,20 +433,25 @@ function showCelebration() {
     const size = 14 + Math.random() * 14;
     particles += `<span class="confetti-piece" style="left:${left}%; animation-delay:${delay}s; animation-duration:${duration}s; font-size:${size}px;">${emoji}</span>`;
   }
-  const quote = FINISH_QUOTES[Math.floor(Math.random() * FINISH_QUOTES.length)];
+  const quote = pickFinishQuote(stats);
   overlay.innerHTML = `
     <div class="confetti-layer">${particles}</div>
     <div class="celebrate-card">
+      <button type="button" class="celebrate-close" aria-label="Закрыть">×</button>
       <span class="celebrate-emoji">🎉</span>
       <p>${quote}</p>
     </div>
   `;
   document.body.appendChild(overlay);
-  overlay.addEventListener("click", () => overlay.remove());
-  window.setTimeout(() => {
+  const close = () => {
     overlay.classList.add("fade-out");
     window.setTimeout(() => overlay.remove(), 400);
-  }, 2600);
+  };
+  overlay.querySelector(".celebrate-close").addEventListener("click", close);
+  const timer = window.setTimeout(close, 7000);
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) { window.clearTimeout(timer); close(); }
+  });
 }
 
 function logWeight(exerciseId, weight, reps) {
@@ -292,6 +505,7 @@ const STORAGE_KEY_LABELS = {
   [STORAGE_LOG]: "журнал_завершённых_тренировок",
   [STORAGE_VIBE]: "текущий_вайб",
   [STORAGE_CALENDAR]: "календарь",
+  [STORAGE_UNDO]: "последняя_отмена",
   "moya-sila-rotation-v1": "очередь_A_B_C",
   "moya-sila-last-by-letter-v1": "что_было_в_прошлый_раз",
 };
@@ -392,6 +606,8 @@ function formatDate() {
 }
 
 function renderTop() {
+  document.body.classList.remove("day-A", "day-B", "day-C");
+  document.body.classList.add(`day-${state.session.letter}`);
   document.getElementById("hero-date").textContent = formatDate();
   document.getElementById("hero-letter").textContent = state.session.letter;
   document.getElementById("hero-focus").textContent = state.session.label;
@@ -467,7 +683,7 @@ function exerciseCard(block, row, index) {
           <div class="ex-meta">${row.slotTitle}${exercise.prescription ? " · " + exercise.prescription : ""}${renderEquipmentBadge(exercise.equipment)}</div>
         </button>
         <button class="ex-copy" title="Скопировать название">⧉</button>
-        <button class="ex-cycle ${isSwapOpen ? "active" : ""}" title="Заменить">⟳</button>
+        <button class="ex-cycle" title="Быстро заменить на следующий вариант">⟳</button>
       </div>
     </article>
   `);
@@ -476,7 +692,7 @@ function exerciseCard(block, row, index) {
   card.querySelector(".ex-skip").addEventListener("click", () => setStatus(key, "skipped"));
   card.querySelector(".ex-main").addEventListener("click", () => toggleExpand(key));
   card.querySelector(".ex-copy").addEventListener("click", (e) => copyName(exercise.nameEn, e.currentTarget));
-  card.querySelector(".ex-cycle").addEventListener("click", () => toggleSwap(key));
+  card.querySelector(".ex-cycle").addEventListener("click", () => quickSwap(block.group, index));
 
   if (isExpanded) {
     const last = lastLog(exercise.id);
@@ -491,11 +707,12 @@ function exerciseCard(block, row, index) {
         <div class="ex-detail-grid">
           <div class="ex-pose">${renderPoseIcon(exercise.pose, accentClass)}</div>
           <div>
+            <p class="ex-muscle">🎯 Работает: <strong>${GROUP_LABELS[exercise.tag] || exercise.tag}</strong></p>
             <p class="ex-cue">${exercise.cue}</p>
-            ${last ? `<p class="ex-last">Прошлый раз: <strong>${last.weight ? last.weight + " кг" : ""}${last.weight && last.reps ? " × " : ""}${last.reps || ""}</strong></p>` : ""}
+            ${last ? `<p class="ex-last">Прошлый раз: <strong>${last.weight ? last.weight + " кг" : ""}${last.weight && last.reps ? " × " : ""}${last.reps || ""}</strong> — подставила ниже, можно просто подтвердить или поправить</p>` : ""}
             <div class="ex-log">
-              <input type="text" inputmode="decimal" placeholder="кг" class="log-weight" />
-              <input type="text" inputmode="numeric" placeholder="повторы" class="log-reps" />
+              <input type="text" inputmode="decimal" placeholder="кг" class="log-weight" value="${last && last.weight ? last.weight : ""}" />
+              <input type="text" inputmode="numeric" placeholder="повторы" class="log-reps" value="${last && last.reps ? last.reps : ""}" />
               <button type="button" class="log-save">Записать</button>
             </div>
             ${timerHtml}
@@ -559,23 +776,128 @@ function renderBlocks() {
   });
 }
 
+function renderUndoBanner() {
+  const wrap = document.getElementById("undo-banner");
+  if (!wrap) return;
+  if (!state.lastUndo) {
+    wrap.classList.add("hidden");
+    wrap.innerHTML = "";
+    return;
+  }
+  wrap.classList.remove("hidden");
+  wrap.innerHTML = `
+    <span>Тренировка «${state.lastUndo.session.letter}» отмечена завершённой.</span>
+    <div class="undo-actions">
+      <button type="button" class="undo-btn">Отменить, вернуться →</button>
+      <button type="button" class="undo-dismiss" aria-label="Скрыть">×</button>
+    </div>
+  `;
+  wrap.querySelector(".undo-btn").addEventListener("click", undoLastFinish);
+  wrap.querySelector(".undo-dismiss").addEventListener("click", dismissUndo);
+}
+
 function renderHistory() {
   const wrap = document.getElementById("history-list");
+  if (!wrap) return;
   wrap.innerHTML = "";
-  const recent = state.log.slice(-8).reverse();
+  const recent = state.log.slice().reverse();
   if (!recent.length) {
     wrap.appendChild(el(`<p class="history-empty">Пока пусто — заверши первую тренировку.</p>`));
     return;
   }
   recent.forEach((entry) => {
     const d = new Date(entry.date);
-    wrap.appendChild(el(`
+    const item = el(`
       <div class="history-item">
-        <div><span class="h-letter">${entry.letter}</span> · ${entry.label}<br />${d.getDate()} ${MONTHS_RU_FULL[d.getMonth()]} · ${entry.done}/${entry.total}${entry.skipped ? ", пропущено " + entry.skipped : ""}
-        ${entry.note ? `<div class="h-note">${entry.note}</div>` : ""}</div>
+        <div class="h-row">
+          <button type="button" class="h-info">
+            <span class="h-letter">${entry.letter}</span> · ${entry.label}<br />
+            <span class="h-sub">${d.getDate()} ${MONTHS_RU_FULL[d.getMonth()]} · ${entry.done}/${entry.total}${entry.skipped ? ", пропущено " + entry.skipped : ""} · открыть отчёт →</span>
+          </button>
+          <button type="button" class="h-delete" title="Удалить запись">🗑</button>
+        </div>
+        <textarea class="h-note-input" placeholder="Добавить заметку…">${entry.note || ""}</textarea>
       </div>
-    `));
+    `);
+    item.querySelector(".h-info").addEventListener("click", () => openReport(entry.id));
+    item.querySelector(".h-delete").addEventListener("click", () => deleteHistoryEntry(entry.id));
+    const noteInput = item.querySelector(".h-note-input");
+    noteInput.addEventListener("change", () => updateHistoryNote(entry.id, noteInput.value.trim()));
+    noteInput.addEventListener("blur", () => updateHistoryNote(entry.id, noteInput.value.trim()));
+    wrap.appendChild(item);
   });
+}
+
+function renderAnalytics() {
+  const wrap = document.getElementById("analytics-grid");
+  if (!wrap) return;
+  const now = new Date();
+  const weekAgo = new Date(now); weekAgo.setDate(weekAgo.getDate() - 7);
+  const monthAgo = new Date(now); monthAgo.setDate(monthAgo.getDate() - 30);
+  const total = state.log.length;
+  const thisWeek = state.log.filter((e) => new Date(e.date) >= weekAgo).length;
+  const thisMonth = state.log.filter((e) => new Date(e.date) >= monthAgo).length;
+  const streak = calculateStreak();
+  const perLetter = { A: 0, B: 0, C: 0 };
+  state.log.forEach((e) => { if (perLetter[e.letter] !== undefined) perLetter[e.letter] += 1; });
+
+  wrap.innerHTML = `
+    <div class="an-tile"><strong>${total}</strong><span>тренировок всего</span></div>
+    <div class="an-tile"><strong>${thisWeek}</strong><span>за 7 дней</span></div>
+    <div class="an-tile"><strong>${thisMonth}</strong><span>за 30 дней</span></div>
+    <div class="an-tile"><strong>${streak}</strong><span>дней подряд с активностью</span></div>
+    <div class="an-tile an-balance">
+      <span class="an-balance-label">Баланс по буквам</span>
+      <div class="an-balance-bars">
+        <span class="an-bar"><i style="width:${total ? (perLetter.A/total*100) : 0}%"></i>A · ${perLetter.A}</span>
+        <span class="an-bar an-bar-b"><i style="width:${total ? (perLetter.B/total*100) : 0}%"></i>B · ${perLetter.B}</span>
+        <span class="an-bar an-bar-c"><i style="width:${total ? (perLetter.C/total*100) : 0}%"></i>C · ${perLetter.C}</span>
+      </div>
+    </div>
+  `;
+}
+
+function renderReportView() {
+  const wrap = document.getElementById("report-content");
+  if (!wrap) return;
+  const entry = state.log.find((e) => e.id === state.reportId);
+  if (!entry) {
+    wrap.innerHTML = `<p class="history-empty">Запись не найдена — возможно, её удалили.</p>`;
+    return;
+  }
+  const d = new Date(entry.date);
+  const exercisesHtml = (entry.exercises || [])
+    .map((ex) => {
+      const statusIcon = ex.status === "done" ? "✓" : ex.status === "skipped" ? "×" : "—";
+      const statusCls = ex.status === "done" ? "done" : ex.status === "skipped" ? "skipped" : "";
+      const weightText = ex.weight || ex.reps ? `${ex.weight ? ex.weight + " кг" : ""}${ex.weight && ex.reps ? " × " : ""}${ex.reps || ""}` : "";
+      return `
+        <div class="report-ex ${statusCls}">
+          <span class="report-ex-status">${statusIcon}</span>
+          <span class="report-ex-name">${ex.name}<small>${ex.slotTitle}</small></span>
+          ${weightText ? `<span class="report-ex-weight">${weightText}</span>` : ""}
+        </div>
+      `;
+    })
+    .join("");
+
+  wrap.innerHTML = `
+    <div class="report-head">
+      <span class="hero-letter" style="background:var(--day-accent-bg); color:var(--day-accent);">${entry.letter}</span>
+      <h2>${entry.label}</h2>
+      <p class="report-meta">${d.getDate()} ${MONTHS_RU_FULL[d.getMonth()]} ${d.getFullYear()} · ${MODE_LABEL[entry.mode] || entry.mode} · вайб «${VIBE_LABEL[entry.vibe] || entry.vibe}»</p>
+      <div class="report-stats">
+        <div><strong>${entry.done}</strong><span>сделано</span></div>
+        <div><strong>${entry.skipped}</strong><span>пропущено</span></div>
+        <div><strong>${entry.total}</strong><span>всего</span></div>
+      </div>
+    </div>
+    ${entry.note ? `<p class="report-note">📝 ${entry.note}</p>` : ""}
+    <div class="report-exercises">${exercisesHtml || '<p class="history-empty">Список упражнений не сохранён для этой записи.</p>'}</div>
+    <button type="button" class="report-delete" id="report-delete-btn">Удалить эту запись</button>
+  `;
+  const delBtn = wrap.querySelector("#report-delete-btn");
+  if (delBtn) delBtn.addEventListener("click", () => { deleteHistoryEntry(entry.id); showView("history"); });
 }
 
 function calendarLabel(entry) {
@@ -675,9 +997,12 @@ function render() {
   renderDaySwitcher();
   renderModePicker();
   renderVibePicker();
+  renderUndoBanner();
   renderBlocks();
   renderCalendar();
   renderHistory();
+  renderAnalytics();
+  renderReportView();
 }
 
 function initFinishButton() {
@@ -703,10 +1028,53 @@ function initExtras() {
   if (prevMonthBtn) prevMonthBtn.addEventListener("click", () => changeCalendarMonth(-1));
   const nextMonthBtn = document.getElementById("calendar-next");
   if (nextMonthBtn) nextMonthBtn.addEventListener("click", () => changeCalendarMonth(1));
+
+  const navHistoryBtn = document.getElementById("nav-history-btn");
+  if (navHistoryBtn) navHistoryBtn.addEventListener("click", () => showView("history"));
+  const backToWorkoutBtn = document.getElementById("back-to-workout-btn");
+  if (backToWorkoutBtn) backToWorkoutBtn.addEventListener("click", () => showView("workout"));
+  const backToHistoryBtn = document.getElementById("back-to-history-btn");
+  if (backToHistoryBtn) backToHistoryBtn.addEventListener("click", () => showView("history"));
+}
+
+function initSplash() {
+  const splash = document.getElementById("splash");
+  const dateEl = document.getElementById("splash-date");
+  const nextEl = document.getElementById("splash-next");
+  const startBtn = document.getElementById("splash-start");
+  if (!splash) return;
+
+  if (dateEl) dateEl.textContent = formatDate();
+  if (nextEl) {
+    const label = SESSION_DEFS[state.session.letter] ? SESSION_DEFS[state.session.letter].label : "";
+    nextEl.innerHTML = `Сегодня по очереди: <strong>${state.session.letter} · ${label}</strong>`;
+  }
+  if (startBtn) {
+    startBtn.addEventListener("click", () => {
+      splash.classList.add("splash-hidden");
+      document.body.classList.remove("splash-open");
+    });
+  }
+}
+
+// Плавно скрывает текущий вид, применяет изменения, затем плавно показывает новый.
+function withTransition(mutateFn) {
+  const targets = [document.querySelector(".hero"), document.getElementById("blocks")].filter(Boolean);
+  if (!targets.length) { mutateFn(); return; }
+  targets.forEach((el) => el.classList.add("view-fade"));
+  window.setTimeout(() => {
+    mutateFn();
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        targets.forEach((el) => el.classList.remove("view-fade"));
+      });
+    });
+  }, 220);
 }
 
 document.addEventListener("DOMContentLoaded", () => {
   render();
   initFinishButton();
   initExtras();
+  initSplash();
 });
