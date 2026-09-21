@@ -13,21 +13,25 @@
 const MODE_RANK = { EXPRESS: 1, NORMAL: 2, FULL: 3 };
 const MODE_LABEL = { EXPRESS: "Экспресс 35–45 мин", NORMAL: "Стандарт 55–70 мин", FULL: "Полная 75–90 мин" };
 
-const VIBES = ["strong", "explore", "fun", "comfort", "pump"];
-const VIBE_LABEL = { strong: "Сила", explore: "Новое", fun: "Фан", comfort: "Комфорт", pump: "Памп" };
+const VIBES = ["strong", "explore", "fun", "comfort", "pump", "mobility"];
+const VIBE_LABEL = { strong: "Сила", explore: "Новое", fun: "Фан", comfort: "Комфорт", pump: "Памп", mobility: "Мобильный акцент" };
 const VIBE_HINT = {
   strong: "Меньше вариаций, больше основного веса",
   explore: "Специально подмешиваю то, что ты давно не делала",
-  fun: "Упор на фан-блок и разнообразие",
+  fun: "Больше вариаций, но без отдельного «челленджа»",
   comfort: "Только простые тренажёры, минимум возни",
   pump: "Больше подходов в работе, лёгкий памп",
+  mobility: "Добавляю больше подвижности и меньше тяжёлой ротации",
 };
 const VIBE_CONFIG = {
   strong: { rotationDelta: -1, suppressFun: true, coreModePreference: ["strength", "sprint"], setupMult: 1, exploreCount: 0 },
   explore: { rotationDelta: 0, coreModePreference: null, setupMult: 1, exploreCount: 1 },
-  fun: { rotationDelta: 1, forceFun: true, coreModePreference: ["sprint", "carry", "weighted"], setupMult: 1, exploreCount: 0 },
+  // «Фан» — это просто более живая ротация обычных движений. Не подмешиваем
+  // переноски или случайный кор как отдельный челлендж.
+  fun: { rotationDelta: 1, suppressFun: true, coreModePreference: ["weighted", "rotation", "strength"], setupMult: 1, exploreCount: 0 },
   comfort: { rotationDelta: 0, coreModePreference: ["strength"], setupMult: 4, exploreCount: 0 },
   pump: { rotationDelta: 1, coreModePreference: ["sprint"], setupMult: 1, exploreCount: 0 },
+  mobility: { rotationDelta: -1, coreModePreference: ["rotation", "weighted"], setupMult: 1, exploreCount: 0 },
 };
 
 const FAMILY_TAGS = {
@@ -65,6 +69,28 @@ const SESSION_DEFS = {
     ],
   },
 };
+
+const FAMILY_DEFS = {
+  LOWER: {
+    label: "Нижняя часть",
+    focuses: [
+      { label: "Ягодицы и задняя цепь", legacyLetter: "A" },
+      { label: "Квадрицепс, икры и односторонние движения", legacyLetter: "C" },
+      { label: "Нижняя часть с мобильностью", legacyLetter: "C", vibe: "mobility" },
+    ],
+  },
+  UPPER: {
+    label: "Верхняя часть",
+    focuses: [
+      { label: "Руки и плечи", legacyLetter: "B" },
+      { label: "Спина и осанка", legacyLetter: "B" },
+      { label: "Сбалансированный верх", legacyLetter: "B" },
+    ],
+  },
+  MOBILITY: { label: "Мобильность и восстановление", focuses: [{ label: "Грудной отдел, плечи, тазобедренные и кор" }] },
+  FULL_BODY: { label: "Всё тело", focuses: [{ label: "Спокойная общая тренировка" }] },
+};
+const FAMILY_ORDER = ["LOWER", "UPPER", "MOBILITY", "FULL_BODY"];
 
 function loadRotationState() {
   try {
@@ -308,7 +334,7 @@ function pickCooldown(letter, rank, usedIds) {
   return items;
 }
 
-function generateSession(letter, mode, vibe) {
+function generateLegacySession(letter, mode, vibe) {
   const def = SESSION_DEFS[letter];
   const rank = MODE_RANK[mode];
   const activeVibe = VIBES.includes(vibe) ? vibe : "strong";
@@ -354,6 +380,183 @@ function generateSession(letter, mode, vibe) {
   };
 }
 
+function loadLastByFamily() {
+  try {
+    const saved = JSON.parse(localStorage.getItem("moya-sila-last-by-family-v1"));
+    if (saved && typeof saved === "object") return saved;
+  } catch (e) {}
+  return {};
+}
+
+function saveLastByFamily(value) {
+  localStorage.setItem("moya-sila-last-by-family-v1", JSON.stringify(value));
+}
+
+function pickFamilyFocus(family) {
+  const def = FAMILY_DEFS[family];
+  const saved = loadLastByFamily();
+  const previous = saved[family] || -1;
+  const index = (previous + 1) % def.focuses.length;
+  saved[family] = index;
+  saveLastByFamily(saved);
+  return def.focuses[index];
+}
+
+function rowFromExercise(exercise, slotTitle) {
+  return { slotKey: "mobility", slotTitle, id: exercise.id, originalId: exercise.id };
+}
+
+function generateMobilitySession(mode, vibe) {
+  const usedIds = new Set();
+  const targetCount = mode === "EXPRESS" ? 6 : mode === "FULL" ? 10 : 8;
+  const pool = EXERCISE_LIBRARY_LIST.filter((ex) => !ex.excludedDefault && (ex.sessionTags.includes("WARMUP") || ex.sessionTags.includes("MOBILITY") || ex.sessionTags.includes("POSTURE") || ex.recovery));
+  const sorted = pool.slice().sort((a, b) => b.prefWeight - a.prefWeight || b.setupWeight - a.setupWeight);
+  const drills = [];
+  for (const ex of sorted) {
+    if (drills.length >= targetCount) break;
+    if (usedIds.has(ex.id)) continue;
+    usedIds.add(ex.id);
+    drills.push(rowFromExercise(ex, "Мобильность · короткий комплекс"));
+  }
+  return {
+    letter: "MOBILITY",
+    family: "MOBILITY",
+    focus: FAMILY_DEFS.MOBILITY.focuses[0].label,
+    label: FAMILY_DEFS.MOBILITY.label,
+    mode,
+    vibe: VIBES.includes(vibe) ? vibe : "mobility",
+    warmup: drills,
+    anchors: [],
+    rotation: [],
+    fun: [],
+    core: [],
+    cooldown: [],
+  };
+}
+
+function addRowMetadata(row, format, circuitId, circuitOrder) {
+  const exercise = EXERCISES[row.id] || {};
+  const equipment = exercise.equipment || "bodyweight";
+  const zoneMap = { freeweight: "dumbbells", barbell: "landmine", smith: "landmine", cable: "cable", machine: "machines", band: "bodyweight", bodyweight: "floor", roller: "floor" };
+  const guide = exercise.weightGuide || (exercise.recovery || exercise.role === "warm-up" ? "Без веса" : exercise.role === "anchor" ? "Тяжёлый рабочий вес" : exercise.role === "skill" ? "Без веса / лёгкая помощь" : "Лёгкий рабочий вес");
+  return { ...row, format, circuitId, circuitOrder, equipmentZone: zoneMap[equipment] || "any", weightGuide: guide };
+}
+
+function pickShortChecklist(family, count, role, usedIds) {
+  const familyTags = family === "LOWER" ? ["A", "C"] : family === "UPPER" ? ["B"] : ["WARMUP", "MOBILITY", "POSTURE"];
+  const isPrep = role === "warmup";
+  let pool = EXERCISE_LIBRARY_LIST.filter((ex) => !ex.excludedDefault && !usedIds.has(ex.id) && (isPrep ? (ex.sessionTags.includes("WARMUP") || ex.tag === "warmup") : (ex.recovery || ex.sessionTags.includes("MOBILITY") || ex.sessionTags.includes("POSTURE"))) && (familyTags.some((tag) => ex.sessionTags.includes(tag)) || ex.sessionTags.includes("WARMUP") || ex.sessionTags.includes("MOBILITY") || ex.sessionTags.includes("POSTURE")));
+  if (pool.length < count) pool = EXERCISE_LIBRARY_LIST.filter((ex) => !ex.excludedDefault && !usedIds.has(ex.id) && (isPrep ? (ex.sessionTags.includes("WARMUP") || ex.tag === "warmup") : (ex.recovery || ex.sessionTags.includes("MOBILITY") || ex.sessionTags.includes("POSTURE"))));
+  return pool.slice().sort((a, b) => b.prefWeight - a.prefWeight).slice(0, count).map((ex, index) => {
+    usedIds.add(ex.id);
+    return addRowMetadata(rowFromExercise(ex, isPrep ? "Разминка · короткое движение" : "Роллер / заминка · короткое движение"), "circuit", role, index + 1);
+  });
+}
+
+function pickMobilityAccent(family, count, usedIds) {
+  return pickShortChecklist(family, count, "mobility-accent", usedIds).map((row) => ({ ...row, slotTitle: "Мобильный акцент · короткое движение" }));
+}
+
+function pickCalisthenicsProgression(count, usedIds, zone) {
+  const names = /pull-up|chin-up|hang|scapular|push-up|plank|dead bug|hollow|inchworm/i;
+  const pool = EXERCISE_LIBRARY_LIST.filter((ex) => !ex.excludedDefault && !usedIds.has(ex.id) && names.test(ex.nameEn) && (zone === "any" || zone === "floor" || ex.equipment === "bodyweight" || ex.equipment === "band"));
+  return pool.slice().sort((a, b) => b.prefWeight - a.prefWeight).slice(0, count).map((ex, index) => {
+    usedIds.add(ex.id);
+    return addRowMetadata(rowFromExercise(ex, "Калистеника · прогрессия"), "sets", "calisthenics", index + 1);
+  });
+}
+
+// Общая зона нужна не только как фильтр в панели замены: при новой генерации
+// она старается собрать силовые движения рядом. Если в этой зоне нет разумной
+// альтернативы, исходное упражнение остаётся — сессия не превращается в пустой список.
+function applyZonePreference(rows, zone) {
+  if (!zone || zone === "any") return rows || [];
+  const chosenIds = new Set();
+  return (rows || []).map((row) => {
+    const currentZone = addRowMetadata({ id: row.id }, "sets", "", 0).equipmentZone;
+    if (currentZone === zone) {
+      chosenIds.add(row.id);
+      return row;
+    }
+    const option = getSwapOptions(row.id, row.originalId, false, zone).find((exercise) => {
+      const optionZone = addRowMetadata({ id: exercise.id }, "sets", "", 0).equipmentZone;
+      return optionZone === zone && !chosenIds.has(exercise.id);
+    });
+    if (!option) return row;
+    chosenIds.add(option.id);
+    return { ...row, id: option.id };
+  });
+}
+
+function decorateSession(session, accents, zone) {
+  const activeAccents = globalThis.MoyaSilaTrainingState ? globalThis.MoyaSilaTrainingState.normalizeAccents(accents) : { mobility: false, calisthenics: false };
+  session.anchors = applyZonePreference(session.anchors, zone);
+  session.rotation = applyZonePreference(session.rotation, zone);
+  session.core = applyZonePreference(session.core, zone);
+  const usedIds = new Set(Object.values(session).filter(Array.isArray).flat().map((row) => row.id));
+  const counts = { EXPRESS: { warmup: 6, cooldown: 6, mobility: 4, calisthenics: 2 }, NORMAL: { warmup: 10, cooldown: 10, mobility: 6, calisthenics: 3 }, FULL: { warmup: 10, cooldown: 10, mobility: 8, calisthenics: 3 } }[session.mode] || { warmup: 10, cooldown: 10, mobility: 6, calisthenics: 3 };
+  if (session.family === "MOBILITY") { counts.warmup = session.mode === "FULL" ? 10 : session.mode === "EXPRESS" ? 6 : 8; counts.cooldown = 0; }
+  session.warmup = pickShortChecklist(session.family, counts.warmup, "warmup", usedIds);
+  session.cooldown = pickShortChecklist(session.family, counts.cooldown, "cooldown", usedIds);
+  session.anchors = (session.anchors || []).map((row) => addRowMetadata(row, "sets", "", 0));
+  session.rotation = (session.rotation || []).map((row) => addRowMetadata(row, "sets", "", 0));
+  session.core = (session.core || []).map((row, index) => addRowMetadata(row, "circuit", "core", index + 1));
+  if (session.mode === "FULL" && session.family !== "MOBILITY") {
+    const extraCore = EXERCISE_LIBRARY_LIST.filter((ex) => ex.tag === "core" && !ex.excludedDefault && !usedIds.has(ex.id)).slice(0, 2);
+    extraCore.forEach((ex, index) => { usedIds.add(ex.id); session.core.push(addRowMetadata(rowFromExercise(ex, "Кор"), "circuit", "core", session.core.length + index + 1)); });
+  }
+  session.fun = [];
+  session.mobilityAccent = activeAccents.mobility ? pickMobilityAccent(session.family, counts.mobility, usedIds) : [];
+  session.calisthenics = activeAccents.calisthenics ? pickCalisthenicsProgression(counts.calisthenics, usedIds, zone) : [];
+  session.accents = activeAccents;
+  session.zone = zone || "any";
+  return session;
+}
+
+function generateFullBodySession(mode, vibe, accents, zone) {
+  const lower = generateLegacySession("A", mode, vibe);
+  const upper = generateLegacySession("B", mode, vibe);
+  const lowerAnchor = lower.anchors[0] ? [lower.anchors[0]] : [];
+  const upperAnchor = upper.anchors[0] ? [upper.anchors[0]] : [];
+  return decorateSession({
+    letter: "FULL_BODY",
+    family: "FULL_BODY",
+    focus: FAMILY_DEFS.FULL_BODY.focuses[0].label,
+    label: FAMILY_DEFS.FULL_BODY.label,
+    mode,
+    vibe: VIBES.includes(vibe) ? vibe : "comfort",
+    warmup: lower.warmup.slice(0, 3),
+    anchors: [...lower.anchors.slice(0, mode === "FULL" ? 2 : 1), ...upper.anchors.slice(0, mode === "FULL" ? 2 : 1)],
+    rotation: [...lower.rotation.slice(0, mode === "FULL" ? 2 : 1), ...upper.rotation.slice(0, mode === "FULL" ? 2 : 1)],
+    fun: [],
+    core: upper.core.slice(0, 1),
+    cooldown: lower.cooldown.slice(0, 2),
+  }, accents, zone);
+}
+
+function generateSession(family, mode, vibe, accents, zone) {
+  const normalized = globalThis.MoyaSilaTrainingState && globalThis.MoyaSilaTrainingState.normalizeFamily(family);
+  const activeFamily = normalized || "LOWER";
+  if (activeFamily === "MOBILITY") return decorateSession(generateMobilitySession(mode, vibe), accents, zone);
+  if (activeFamily === "FULL_BODY") return generateFullBodySession(mode, vibe, accents, zone);
+
+  const focus = pickFamilyFocus(activeFamily);
+  const legacy = generateLegacySession(focus.legacyLetter, mode, focus.vibe || vibe);
+  return decorateSession({
+    ...legacy,
+    letter: activeFamily,
+    family: activeFamily,
+    focus: focus.label,
+    label: FAMILY_DEFS[activeFamily].label,
+  }, accents, zone);
+}
+
+function nextFamilyAfter(family) {
+  const normalized = globalThis.MoyaSilaTrainingState && globalThis.MoyaSilaTrainingState.normalizeFamily(family);
+  const index = FAMILY_ORDER.indexOf(normalized || "LOWER");
+  return FAMILY_ORDER[(index + 1) % FAMILY_ORDER.length];
+}
+
 function nextLetterAfter(letter) {
   const order = ["A", "B", "C"];
   const idx = order.indexOf(letter);
@@ -362,12 +565,28 @@ function nextLetterAfter(letter) {
 
 // Полный список реальных вариантов на замену + гарантированное исходное упражнение,
 // чтобы всегда можно было вернуться назад одним тапом.
-function getSwapOptions(currentId, originalId, isPrepSlot) {
+function getSwapOptions(currentId, originalId, isPrepSlot, zone) {
   const current = EXERCISES[currentId];
   if (!current) return [];
+  const relatedTags = {
+    back: ["back", "biceps"],
+    shoulders: ["shoulders", "chest", "triceps"],
+    chest: ["chest", "shoulders", "triceps"],
+    "glute-max": ["glute-max", "hamstrings", "quads"],
+    quads: ["quads", "glute-max", "hamstrings", "adductors"],
+    hamstrings: ["hamstrings", "glute-max", "quads"],
+    "glute-medius": ["glute-medius", "glute-max", "quads", "adductors"],
+    adductors: ["adductors", "glute-max", "quads", "hamstrings"],
+    calves: ["calves", "quads", "glute-max"],
+    core: ["core"],
+  }[current.tag] || [current.tag];
   const pool = EXERCISE_LIBRARY_LIST.filter((ex) => {
-    if (ex.tag !== current.tag || ex.excludedDefault) return false;
+    if (!relatedTags.includes(ex.tag) || ex.excludedDefault) return false;
     if (!isPrepSlot && (ex.recovery || ex.role === "warm-up" || ex.role === "cardio" || ex.role === "recovery" || ex.role === "optional-activity")) return false;
+    if (zone && zone !== "any") {
+      const rowZone = addRowMetadata({ id: ex.id }, "sets", "", 0).equipmentZone;
+      if (rowZone !== zone && ex.id !== currentId && ex.id !== originalId) return false;
+    }
     return true;
   });
   const preferredIds = [current.alt1, current.alt2].filter(Boolean);
@@ -376,8 +595,8 @@ function getSwapOptions(currentId, originalId, isPrepSlot) {
     score: (preferredIds.includes(ex.id) ? 5 : 0) + ex.prefWeight * 2 + ex.setupWeight,
   }));
   scored.sort((a, b) => b.score - a.score);
-  const ids = scored.slice(0, 7).map((s) => s.ex.id);
+  const ids = scored.slice(0, 11).map((s) => s.ex.id);
   if (originalId && !ids.includes(originalId) && EXERCISES[originalId]) ids.unshift(originalId);
   if (!ids.includes(currentId) && EXERCISES[currentId]) ids.unshift(currentId);
-  return ids.slice(0, 8).map((id) => EXERCISES[id]);
+  return ids.slice(0, 12).map((id) => EXERCISES[id]);
 }

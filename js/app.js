@@ -9,8 +9,12 @@ const STORAGE_VIBE = "moya-sila-vibe-v1";
 const STORAGE_CALENDAR = "moya-sila-calendar-v1";
 const STORAGE_RIR_SEEN = "moya-sila-rir-seen-v1";
 const STORAGE_UNDO = "moya-sila-undo-v1";
+const STORAGE_MANUAL_ACTIVITIES = "moya-sila-manual-activities-v1";
+const STORAGE_DRAFT_WEIGHT_IDS = "moya-sila-draft-weight-ids-v1";
+const STORAGE_ACCENTS = "moya-sila-accents-v1";
+const STORAGE_ZONE = "moya-sila-zone-v1";
 
-const ALL_STORAGE_KEYS = [STORAGE_MODE, STORAGE_SESSION, STORAGE_STATUS, STORAGE_HISTORY, STORAGE_LOG, STORAGE_VIBE, STORAGE_CALENDAR, STORAGE_UNDO, "moya-sila-rotation-v1", "moya-sila-last-by-letter-v1"];
+const ALL_STORAGE_KEYS = [STORAGE_MODE, STORAGE_SESSION, STORAGE_STATUS, STORAGE_HISTORY, STORAGE_LOG, STORAGE_VIBE, STORAGE_CALENDAR, STORAGE_UNDO, STORAGE_MANUAL_ACTIVITIES, STORAGE_DRAFT_WEIGHT_IDS, STORAGE_ACCENTS, STORAGE_ZONE, "moya-sila-rotation-v1", "moya-sila-last-by-letter-v1", "moya-sila-last-by-family-v1"];
 
 function makeId() {
   return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
@@ -48,18 +52,32 @@ const state = {
   history: loadJSON(STORAGE_HISTORY, {}), // exerciseId -> [{date, weight, reps}]
   log: loadJSON(STORAGE_LOG, []),
   calendar: loadJSON(STORAGE_CALENDAR, {}), // dateKey -> {type: 'session'|'cardio'|'other'|'rest', letter?}
+  manualActivities: loadJSON(STORAGE_MANUAL_ACTIVITIES, {}),
+  draftWeightIds: loadJSON(STORAGE_DRAFT_WEIGHT_IDS, []),
+  accents: MoyaSilaTrainingState.normalizeAccents(loadJSON(STORAGE_ACCENTS, {})),
+  zone: MoyaSilaTrainingState.normalizeZone(loadJSON(STORAGE_ZONE, "any")),
+  blockZones: {},
   lastUndo: loadJSON(STORAGE_UNDO, null),
-  view: "workout", // 'workout' | 'history' | 'report'
+  view: "home", // 'home' | 'workout' | 'history' | 'report'
   reportId: null,
   expanded: null,
   swapOpenKey: null,
   calendarOpenDay: null,
   calendarMonth: { year: new Date().getFullYear(), month: new Date().getMonth() },
+  activityEditor: { key: null, type: "other", family: "unknown" },
   timer: { key: null, seconds: 0, running: false, interval: null },
 };
 if (!state.session) {
-  state.session = generateSession(rotation.next, state.mode, state.vibe);
+  state.session = generateSession("LOWER", state.mode, state.vibe);
   saveJSON(STORAGE_SESSION, state.session);
+}
+state.session.accents = MoyaSilaTrainingState.normalizeAccents(state.session.accents || state.accents);
+state.session.zone = MoyaSilaTrainingState.normalizeZone(state.session.zone || state.zone);
+saveJSON(STORAGE_SESSION, state.session);
+
+function selectedSessionDateKey() {
+  const input = document.getElementById("session-date");
+  return input && /^\d{4}-\d{2}-\d{2}$/.test(input.value) ? input.value : dateKey(new Date());
 }
 if (typeof localStorage.getItem(STORAGE_MODE) !== "string") saveJSON(STORAGE_MODE, state.mode);
 
@@ -67,8 +85,9 @@ const BLOCKS = [
   { group: "warmup", title: "Разминка", cls: "block-warmup" },
   { group: "anchors", title: "Основные", cls: "block-main" },
   { group: "rotation", title: "Ротация / любимое", cls: "block-rotation" },
-  { group: "fun", title: "Фан / челлендж", cls: "block-fun" },
   { group: "core", title: "Кор", cls: "block-core" },
+  { group: "mobilityAccent", title: "Мобильный акцент", cls: "block-mobility" },
+  { group: "calisthenics", title: "Калистеника · прогрессия", cls: "block-calisthenics" },
   { group: "cooldown", title: "Растяжка / роллер", cls: "block-cooldown" },
 ];
 
@@ -131,7 +150,7 @@ function applySwap(group, index, newId) {
 function quickSwap(group, index) {
   const row = getRow(group, index);
   const isPrepSlot = group === "warmup" || group === "cooldown";
-  const options = getSwapOptions(row.id, row.originalId, isPrepSlot);
+  const options = getSwapOptions(row.id, row.originalId, isPrepSlot, state.blockZones[group] || "any");
   if (options.length < 2) return;
   const ids = options.map((o) => o.id);
   const curIdx = ids.indexOf(row.id);
@@ -145,25 +164,27 @@ function changeMode(mode) {
   withTransition(() => {
     state.mode = mode;
     saveJSON(STORAGE_MODE, mode);
-    state.session = generateSession(state.session.letter, mode, state.vibe);
+    state.session = generateSession(state.session.family || state.session.letter, mode, state.vibe, state.accents, state.zone);
     saveJSON(STORAGE_SESSION, state.session);
     state.status = {};
     saveJSON(STORAGE_STATUS, state.status);
+    clearDraftWeightIds();
     state.expanded = null;
     state.swapOpenKey = null;
     render();
   });
 }
 
-function switchDay(letter) {
+function startFamilySession(family) {
   withTransition(() => {
-    state.session = generateSession(letter, state.mode, state.vibe);
+    state.session = generateSession(family, state.mode, state.vibe, state.accents, state.zone);
     saveJSON(STORAGE_SESSION, state.session);
     state.status = {};
     saveJSON(STORAGE_STATUS, state.status);
+    clearDraftWeightIds();
     state.expanded = null;
     state.swapOpenKey = null;
-    render();
+    showView("workout");
   });
 }
 
@@ -171,10 +192,11 @@ function changeVibe(vibe) {
   withTransition(() => {
     state.vibe = vibe;
     saveVibeState({ current: vibe });
-    state.session = generateSession(state.session.letter, state.mode, vibe);
+    state.session = generateSession(state.session.family || state.session.letter, state.mode, vibe, state.accents, state.zone);
     saveJSON(STORAGE_SESSION, state.session);
     state.status = {};
     saveJSON(STORAGE_STATUS, state.status);
+    clearDraftWeightIds();
     state.expanded = null;
     state.swapOpenKey = null;
     render();
@@ -185,7 +207,7 @@ function changeVibe(vibe) {
 
 function showView(view) {
   state.view = view;
-  ["view-workout", "view-history", "view-report"].forEach((id) => {
+  ["view-home", "view-workout", "view-history", "view-report"].forEach((id) => {
     const el2 = document.getElementById(id);
     if (el2) el2.classList.toggle("hidden", id !== `view-${view}`);
   });
@@ -206,17 +228,84 @@ function setCalendarDay(key, type) {
   render();
 }
 
+const ACTIVITY_TYPES = [
+  ["run", "Бег"], ["walk", "Прогулка"], ["stretch", "Растяжка"],
+  ["mobility", "Мобильность"], ["gym", "Тренировка в зале"], ["other", "Другое"], ["rest", "Отдых"],
+];
+
+function getCalendarEntry(key) {
+  const session = state.log.find((entry) => dateKey(new Date(entry.date)) === key);
+  if (session) return { type: "session", letter: session.family || session.letter, label: session.label };
+  const manual = state.manualActivities[key];
+  if (manual) return { type: manual.type, note: manual.note };
+  return state.calendar[key] || null;
+}
+
+function openActivityEditor(key = dateKey(new Date())) {
+  const modal = document.getElementById("activity-modal");
+  const existing = state.manualActivities[key] || state.calendar[key] || {};
+  state.activityEditor = { key, type: existing.type || "other", family: existing.family || "unknown" };
+  document.getElementById("activity-date").value = key;
+  document.getElementById("activity-note").value = existing.note || "";
+  renderActivityTypes();
+  document.getElementById("activity-delete-btn").classList.toggle("hidden", !state.manualActivities[key]);
+  modal.classList.remove("hidden");
+}
+
+function closeActivityEditor() { document.getElementById("activity-modal").classList.add("hidden"); }
+
+function renderActivityTypes() {
+  const wrap = document.getElementById("activity-types");
+  if (!wrap) return;
+  wrap.innerHTML = "";
+  ACTIVITY_TYPES.forEach(([type, label]) => {
+    const button = el(`<button type="button" class="${type === state.activityEditor.type ? "active" : ""}" data-type="${type}">${label}</button>`);
+    button.addEventListener("click", () => { state.activityEditor.type = type; renderActivityTypes(); });
+    wrap.appendChild(button);
+  });
+  const gymWrap = document.getElementById("activity-gym-family");
+  gymWrap.classList.toggle("hidden", state.activityEditor.type !== "gym");
+  gymWrap.innerHTML = "";
+  if (state.activityEditor.type === "gym") {
+    [["LOWER", "Низ"], ["UPPER", "Верх"], ["MOBILITY", "Мобильность"], ["FULL_BODY", "Всё тело"], ["unknown", "Не помню"]].forEach(([family, label]) => {
+      const button = el(`<button type="button" class="${state.activityEditor.family === family ? "active" : ""}">${label}</button>`);
+      button.addEventListener("click", () => { state.activityEditor.family = family; renderActivityTypes(); });
+      gymWrap.appendChild(button);
+    });
+  }
+}
+
+function saveActivityEditor() {
+  const key = document.getElementById("activity-date").value;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(key) || key > dateKey(new Date())) return;
+  if (state.activityEditor.key !== key) delete state.manualActivities[state.activityEditor.key];
+  state.manualActivities = MoyaSilaTrainingState.setManualActivity(state.manualActivities, key, {
+    type: state.activityEditor.type,
+    family: state.activityEditor.type === "gym" ? state.activityEditor.family : "",
+    note: document.getElementById("activity-note").value.trim(),
+  });
+  saveJSON(STORAGE_MANUAL_ACTIVITIES, state.manualActivities);
+  closeActivityEditor();
+  render();
+}
+
+function deleteActivityEditor() {
+  state.manualActivities = MoyaSilaTrainingState.removeManualActivity(state.manualActivities, state.activityEditor.key);
+  saveJSON(STORAGE_MANUAL_ACTIVITIES, state.manualActivities);
+  closeActivityEditor();
+  render();
+}
+
 // Полный слепок тренировки для отчёта: что было в каждом блоке, отмечено ли,
 // и какой вес/повторы записаны именно сегодня (чтобы отчёт не тянул старые записи).
-function snapshotSessionExercises() {
-  const todayKey = dateKey(new Date());
+function snapshotSessionExercises(sessionKey) {
   const out = [];
   BLOCKS.forEach((b) => {
     (state.session[b.group] || []).forEach((row, i) => {
       const exercise = EXERCISES[row.id];
       const key = slotKey(b.group, i);
       const last = lastLog(row.id);
-      const loggedToday = last && dateKey(new Date(last.date)) === todayKey ? last : null;
+      const loggedToday = last && dateKey(new Date(last.date)) === sessionKey ? last : null;
       out.push({
         id: row.id,
         name: exercise.nameEn,
@@ -232,13 +321,25 @@ function snapshotSessionExercises() {
   return out;
 }
 
+function commitDraftWeights(sessionKey) {
+  const draftIds = new Set(state.draftWeightIds);
+  if (!draftIds.size) return;
+  Object.values(state.history).forEach((entries) => {
+    entries.forEach((entry) => {
+      if (draftIds.has(entry.id)) entry.date = MoyaSilaTrainingState.toSessionIso(sessionKey);
+    });
+  });
+  saveJSON(STORAGE_HISTORY, state.history);
+}
+
 function finishSession() {
   const rows = allTrackableRows();
   const doneCount = rows.filter((r) => state.status[slotKey(r.group, r.index)] === "done").length;
   const skippedCount = rows.filter((r) => state.status[slotKey(r.group, r.index)] === "skipped").length;
   const note = (document.getElementById("session-note").value || "").trim();
-  const todayKey = dateKey(new Date());
-  const exercisesSnapshot = snapshotSessionExercises();
+  const todayKey = selectedSessionDateKey();
+  commitDraftWeights(todayKey);
+  const exercisesSnapshot = snapshotSessionExercises(todayKey);
 
   // Снэпшот всего, что мы сейчас поменяем — чтобы можно было одним тапом откатить,
   // если "Готово" нажали случайно или слишком рано.
@@ -255,8 +356,10 @@ function finishSession() {
   const logId = makeId();
   state.log.push({
     id: logId,
-    date: new Date().toISOString(),
+    date: MoyaSilaTrainingState.toSessionIso(todayKey),
     letter: state.session.letter,
+    family: state.session.family || state.session.letter,
+    focus: state.session.focus || state.session.label,
     label: state.session.label,
     mode: state.session.mode,
     vibe: state.session.vibe,
@@ -272,8 +375,8 @@ function finishSession() {
   state.calendar[todayKey] = { type: "session", letter: state.session.letter };
   saveJSON(STORAGE_CALENDAR, state.calendar);
 
-  rotation.history.push(state.session.letter);
-  rotation.next = nextLetterAfter(state.session.letter);
+  rotation.history.push(state.session.family || state.session.letter);
+  rotation.next = MoyaSilaTrainingState.getRecommendation(state.log).suggestedFamilies[0];
   saveRotationState(rotation);
 
   state.vibe = nextVibeAfter(state.vibe);
@@ -283,6 +386,8 @@ function finishSession() {
   saveJSON(STORAGE_SESSION, state.session);
   state.status = {};
   saveJSON(STORAGE_STATUS, state.status);
+  state.draftWeightIds = [];
+  saveJSON(STORAGE_DRAFT_WEIGHT_IDS, state.draftWeightIds);
   state.expanded = null;
   state.swapOpenKey = null;
   document.getElementById("session-note").value = "";
@@ -301,7 +406,7 @@ function calculateStreak() {
   const d = new Date();
   while (true) {
     const key = dateKey(d);
-    if (!state.calendar[key]) break;
+    if (!getCalendarEntry(key)) break;
     streak += 1;
     d.setDate(d.getDate() - 1);
   }
@@ -376,6 +481,19 @@ function updateHistoryNote(id, note) {
   if (!entry) return;
   entry.note = note;
   saveJSON(STORAGE_LOG, state.log);
+}
+
+function updateHistoryDate(id, nextKey) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(nextKey) || nextKey > dateKey(new Date())) return;
+  const entry = state.log.find((item) => item.id === id);
+  if (!entry) return;
+  const previousKey = dateKey(new Date(entry.date));
+  state.log = MoyaSilaTrainingState.moveSessionLogDate(state.log, id, nextKey);
+  saveJSON(STORAGE_LOG, state.log);
+  if (state.calendar[previousKey] && state.calendar[previousKey].type === "session") delete state.calendar[previousKey];
+  state.calendar[nextKey] = { type: "session", letter: entry.family || entry.letter };
+  saveJSON(STORAGE_CALENDAR, state.calendar);
+  render();
 }
 
 const FINISH_QUOTES = [
@@ -457,10 +575,18 @@ function showCelebration(stats) {
 function logWeight(exerciseId, weight, reps) {
   if (!weight && !reps) return;
   const list = state.history[exerciseId] || [];
-  list.push({ date: new Date().toISOString(), weight: weight || "", reps: reps || "" });
+  const id = makeId();
+  list.push({ id, date: new Date().toISOString(), weight: weight || "", reps: reps || "" });
   state.history[exerciseId] = list.slice(-20);
   saveJSON(STORAGE_HISTORY, state.history);
+  state.draftWeightIds.push(id);
+  saveJSON(STORAGE_DRAFT_WEIGHT_IDS, state.draftWeightIds);
   render();
+}
+
+function clearDraftWeightIds() {
+  state.draftWeightIds = [];
+  saveJSON(STORAGE_DRAFT_WEIGHT_IDS, state.draftWeightIds);
 }
 
 function lastLog(exerciseId) {
@@ -505,9 +631,12 @@ const STORAGE_KEY_LABELS = {
   [STORAGE_LOG]: "журнал_завершённых_тренировок",
   [STORAGE_VIBE]: "текущий_вайб",
   [STORAGE_CALENDAR]: "календарь",
+  [STORAGE_MANUAL_ACTIVITIES]: "ручные_активности_календаря",
+  [STORAGE_DRAFT_WEIGHT_IDS]: "черновые_записи_весов",
   [STORAGE_UNDO]: "последняя_отмена",
   "moya-sila-rotation-v1": "очередь_A_B_C",
   "moya-sila-last-by-letter-v1": "что_было_в_прошлый_раз",
+  "moya-sila-last-by-family-v1": "что_было_в_прошлый_раз_по_формату",
 };
 const REVERSE_KEY_LABELS = Object.fromEntries(Object.entries(STORAGE_KEY_LABELS).map(([k, v]) => [v, k]));
 
@@ -606,10 +735,10 @@ function formatDate() {
 }
 
 function renderTop() {
-  document.body.classList.remove("day-A", "day-B", "day-C");
-  document.body.classList.add(`day-${state.session.letter}`);
+  document.body.classList.remove("day-A", "day-B", "day-C", "day-LOWER", "day-UPPER", "day-MOBILITY", "day-FULL_BODY");
+  document.body.classList.add(`day-${state.session.family || state.session.letter}`);
   document.getElementById("hero-date").textContent = formatDate();
-  document.getElementById("hero-letter").textContent = state.session.letter;
+  document.getElementById("hero-letter").textContent = state.session.family === "FULL_BODY" ? "ВСЁ" : state.session.family === "MOBILITY" ? "MOB" : state.session.family || state.session.letter;
   document.getElementById("hero-focus").textContent = state.session.label;
   document.getElementById("hero-sub").textContent = `${MODE_LABEL[state.session.mode]} · вайб «${VIBE_LABEL[state.session.vibe]}»`;
   const pct = progressPercent();
@@ -617,14 +746,30 @@ function renderTop() {
   document.getElementById("progress-value").textContent = `${pct}%`;
 }
 
-function renderDaySwitcher() {
-  const wrap = document.getElementById("day-switcher");
-  wrap.innerHTML = "";
-  ["A", "B", "C"].forEach((letter) => {
-    const btn = el(`<button type="button" class="${letter === state.session.letter ? "active" : ""}">${letter}</button>`);
-    btn.addEventListener("click", () => switchDay(letter));
-    wrap.appendChild(btn);
-  });
+function renderHome() {
+  const recommendation = MoyaSilaTrainingState.getRecommendation(state.log);
+  const recommendationEl = document.getElementById("home-recommendation");
+  if (recommendationEl) recommendationEl.textContent = recommendation.text;
+  const today = document.getElementById("home-today");
+  if (today) today.textContent = formatDate();
+  const grid = document.getElementById("family-grid");
+  if (grid) {
+    const cards = [
+      ["LOWER", "Нижняя часть", "ягодицы, ноги и опора"],
+      ["UPPER", "Верхняя часть", "руки, плечи и осанка"],
+      ["MOBILITY", "Мобильность и восстановление", "короткий комплекс для всего тела"],
+      ["FULL_BODY", "Общее тело", "вернуться после паузы или собрать всё"],
+    ];
+    grid.innerHTML = "";
+    cards.forEach(([family, title, desc]) => {
+      const card = el(`<button type="button" class="family-card family-${family.toLowerCase()}"><span>${family === "MOBILITY" ? "◌" : family === "FULL_BODY" ? "✦" : family === "LOWER" ? "⌄" : "⌃"}</span><strong>${title}</strong><small>${desc}</small><i>Открыть →</i></button>`);
+      card.addEventListener("click", () => startFamilySession(family));
+      grid.appendChild(card);
+    });
+  }
+  const stats = MoyaSilaTrainingState.getMonthStats(state.log, state.manualActivities);
+  const statsEl = document.getElementById("home-stats");
+  if (statsEl) statsEl.innerHTML = `<div><strong>${stats.strength}</strong><span>силовых за месяц</span></div><div><strong>${stats.mobility}</strong><span>мобильности</span></div><div><strong>${stats.other}</strong><span>другой активности</span></div>`;
 }
 
 function renderModePicker() {
@@ -650,6 +795,41 @@ function renderVibePicker() {
   if (hint) hint.textContent = VIBE_HINT[state.vibe];
 }
 
+function regenerateForOptions() {
+  state.session = generateSession(state.session.family || state.session.letter, state.mode, state.vibe, state.accents, state.zone);
+  saveJSON(STORAGE_SESSION, state.session);
+  state.status = {};
+  saveJSON(STORAGE_STATUS, state.status);
+  render();
+}
+
+function renderAccentPicker() {
+  const wrap = document.getElementById("accent-picker");
+  if (!wrap) return;
+  wrap.innerHTML = "";
+  [["mobility", "+ Мобильность"], ["calisthenics", "+ Калистеника"]].forEach(([name, label]) => {
+    const button = el(`<button type="button" class="${state.accents[name] ? "selected" : ""}">${label}</button>`);
+    button.addEventListener("click", () => {
+      state.accents = MoyaSilaTrainingState.toggleAccent(state.accents, name);
+      saveJSON(STORAGE_ACCENTS, state.accents);
+      regenerateForOptions();
+    });
+    wrap.appendChild(button);
+  });
+}
+
+function renderZonePicker() {
+  const wrap = document.getElementById("zone-picker");
+  if (!wrap) return;
+  const labels = { any: "Любая зона", dumbbells: "Гантели", landmine: "Штанга / landmine", cable: "Кабель", machines: "Тренажёры", bodyweight: "Резинка / вес тела", floor: "Коврик / роллер" };
+  wrap.innerHTML = "";
+  Object.entries(labels).forEach(([zone, label]) => {
+    const button = el(`<button type="button" class="${zone === state.zone ? "selected" : ""}">${label}</button>`);
+    button.addEventListener("click", () => { state.zone = zone; saveJSON(STORAGE_ZONE, zone); regenerateForOptions(); });
+    wrap.appendChild(button);
+  });
+}
+
 function toggleRirInfo() {
   const box = document.getElementById("rir-info");
   box.classList.toggle("hidden");
@@ -663,7 +843,7 @@ function exerciseCard(block, row, index) {
   const isExpanded = state.expanded === key;
   const isSwapOpen = state.swapOpenKey === key;
   const isPrepSlot = block.group === "warmup" || block.group === "cooldown";
-  const accentMap = { warmup: "warmup", core: "core", cooldown: "cooldown", rotation: "rotation", fun: "fun", anchors: "main" };
+  const accentMap = { warmup: "warmup", core: "core", cooldown: "cooldown", rotation: "rotation", mobilityAccent: "cooldown", calisthenics: "rotation", anchors: "main" };
   const accentClass = accentMap[block.group] || "main";
   const wasSwapped = row.originalId && row.originalId !== row.id;
 
@@ -671,19 +851,19 @@ function exerciseCard(block, row, index) {
     <article class="ex-card ${status || ""} ${row.optional ? "optional" : ""}">
       <div class="ex-row">
         <div class="ex-status">
-          <button class="ex-check" title="Сделано">${status === "done" ? "✓" : ""}</button>
-          <button class="ex-skip" title="Пропустить">${status === "skipped" ? "×" : ""}</button>
+          <button class="ex-check" title="Сделано" aria-label="Отметить упражнение как сделанное">${status === "done" ? "✓" : ""}</button>
+          <button class="ex-skip" title="Пропустить" aria-label="Пропустить упражнение">${status === "skipped" ? "×" : ""}</button>
         </div>
-        <button class="ex-main">
+        <button class="ex-main" aria-label="Открыть детали упражнения ${exercise.nameEn}">
           <div class="ex-name-row">
             <span class="ex-name-en">${exercise.nameEn}</span>
             ${row.explore ? '<span class="ex-badge ex-badge-explore">новое</span>' : ""}
             ${wasSwapped ? '<span class="ex-badge ex-badge-swapped">заменено</span>' : ""}
           </div>
-          <div class="ex-meta">${row.slotTitle}${exercise.prescription ? " · " + exercise.prescription : ""}${renderEquipmentBadge(exercise.equipment)}</div>
+          <div class="ex-meta">${exercise.prescription || row.slotTitle}${renderEquipmentBadge(exercise.equipment)}</div>
         </button>
-        <button class="ex-copy" title="Скопировать название">⧉</button>
-        <button class="ex-cycle" title="Быстро заменить на следующий вариант">⟳</button>
+        <button class="ex-copy" title="Скопировать название" aria-label="Скопировать название упражнения">⧉</button>
+        <button class="ex-cycle" title="Быстро заменить на следующий вариант" aria-label="Быстро заменить упражнение">⟳</button>
       </div>
     </article>
   `);
@@ -709,6 +889,7 @@ function exerciseCard(block, row, index) {
           <div>
             <p class="ex-muscle">🎯 Работает: <strong>${GROUP_LABELS[exercise.tag] || exercise.tag}</strong></p>
             <p class="ex-cue">${exercise.cue}</p>
+            <p class="ex-weight-guide">${row.weightGuide || "Вес: выбери тот, с которым техника остаётся чистой."}</p>
             ${last ? `<p class="ex-last">Прошлый раз: <strong>${last.weight ? last.weight + " кг" : ""}${last.weight && last.reps ? " × " : ""}${last.reps || ""}</strong> — подставила ниже, можно просто подтвердить или поправить</p>` : ""}
             <div class="ex-log">
               <input type="text" inputmode="decimal" placeholder="кг" class="log-weight" value="${last && last.weight ? last.weight : ""}" />
@@ -734,11 +915,11 @@ function exerciseCard(block, row, index) {
 
     if (isSwapOpen) {
       const chipsWrap = detail.querySelector(".swap-chips");
-      const options = getSwapOptions(row.id, row.originalId, isPrepSlot);
+      const options = getSwapOptions(row.id, row.originalId, isPrepSlot, state.blockZones[block.group] || "any");
       options.forEach((opt) => {
         const isCurrent = opt.id === row.id;
         const isOriginal = opt.id === row.originalId && row.originalId !== row.id;
-        const chip = el(`<button type="button" class="swap-chip ${isCurrent ? "current" : ""}">${opt.nameEn}${isOriginal ? " ↺" : ""}</button>`);
+        const chip = el(`<button type="button" class="swap-chip ${isCurrent ? "current" : ""}">${renderEquipmentBadge(opt.equipment)} ${opt.nameEn}${isOriginal ? " ↺" : ""}</button>`);
         chip.addEventListener("click", () => applySwap(block.group, index, opt.id));
         chipsWrap.appendChild(chip);
       });
@@ -758,6 +939,16 @@ function formatSeconds(total) {
   return `${mins}:${secs}`;
 }
 
+function quickChecklistCard(block, row, index) {
+  const exercise = EXERCISES[row.id];
+  const key = slotKey(block.group, index);
+  const done = state.status[key] === "done";
+  const card = el(`<button type="button" class="quick-check ${done ? "done" : ""}"><span>${done ? "✓" : ""}</span><strong>${exercise.nameEn}</strong><i>⧉</i></button>`);
+  card.addEventListener("click", () => setStatus(key, "done"));
+  card.querySelector("i").addEventListener("click", (event) => { event.stopPropagation(); copyName(exercise.nameEn, event.currentTarget); });
+  return card;
+}
+
 function renderBlocks() {
   const wrap = document.getElementById("blocks");
   wrap.innerHTML = "";
@@ -771,7 +962,21 @@ function renderBlocks() {
       </section>
     `);
     const list = section.querySelector(".block-list");
-    rows.forEach((row, i) => list.appendChild(exerciseCard(block, row, i)));
+    if (["warmup", "cooldown", "mobilityAccent"].includes(block.group)) {
+      section.querySelector(".block-head").insertAdjacentHTML("beforeend", `<small>Отметь то, что сделала</small>`);
+      rows.forEach((row, i) => list.appendChild(quickChecklistCard(block, row, i)));
+    } else {
+      if (["anchors", "rotation", "core", "calisthenics"].includes(block.group)) {
+        const select = el(`<select class="block-zone" aria-label="Зона для замен в блоке"><option value="any">Любая зона</option><option value="dumbbells">Гантели</option><option value="landmine">Штанга / landmine</option><option value="cable">Кабель</option><option value="machines">Тренажёры</option><option value="bodyweight">Резинка / вес тела</option><option value="floor">Коврик / роллер</option></select>`);
+        select.value = state.blockZones[block.group] || "any";
+        select.addEventListener("change", () => { state.blockZones[block.group] = select.value; });
+        section.querySelector(".block-head").appendChild(select);
+      }
+      if (rows.some((row) => row.format === "circuit")) {
+        section.querySelector(".block-head").insertAdjacentHTML("afterend", `<p class="circuit-help">Круг: подряд → отдых → повторить 2–3 раза</p>`);
+      }
+      rows.forEach((row, i) => list.appendChild(exerciseCard(block, row, i)));
+    }
     wrap.appendChild(section);
   });
 }
@@ -816,6 +1021,7 @@ function renderHistory() {
           </button>
           <button type="button" class="h-delete" title="Удалить запись">🗑</button>
         </div>
+        <label class="h-date-label">Дата <input type="date" value="${dateKey(d)}" max="${dateKey(new Date())}" /></label>
         <textarea class="h-note-input" placeholder="Добавить заметку…">${entry.note || ""}</textarea>
       </div>
     `);
@@ -824,6 +1030,7 @@ function renderHistory() {
     const noteInput = item.querySelector(".h-note-input");
     noteInput.addEventListener("change", () => updateHistoryNote(entry.id, noteInput.value.trim()));
     noteInput.addEventListener("blur", () => updateHistoryNote(entry.id, noteInput.value.trim()));
+    item.querySelector(".h-date-label input").addEventListener("change", (event) => updateHistoryDate(entry.id, event.target.value));
     wrap.appendChild(item);
   });
 }
@@ -838,8 +1045,8 @@ function renderAnalytics() {
   const thisWeek = state.log.filter((e) => new Date(e.date) >= weekAgo).length;
   const thisMonth = state.log.filter((e) => new Date(e.date) >= monthAgo).length;
   const streak = calculateStreak();
-  const perLetter = { A: 0, B: 0, C: 0 };
-  state.log.forEach((e) => { if (perLetter[e.letter] !== undefined) perLetter[e.letter] += 1; });
+  const perFamily = { LOWER: 0, UPPER: 0, MOBILITY: 0, FULL_BODY: 0 };
+  state.log.forEach((e) => { const family = MoyaSilaTrainingState.normalizeFamily(e.family || e.letter); if (perFamily[family] !== undefined) perFamily[family] += 1; });
 
   wrap.innerHTML = `
     <div class="an-tile"><strong>${total}</strong><span>тренировок всего</span></div>
@@ -847,11 +1054,11 @@ function renderAnalytics() {
     <div class="an-tile"><strong>${thisMonth}</strong><span>за 30 дней</span></div>
     <div class="an-tile"><strong>${streak}</strong><span>дней подряд с активностью</span></div>
     <div class="an-tile an-balance">
-      <span class="an-balance-label">Баланс по буквам</span>
+      <span class="an-balance-label">Баланс по форматам</span>
       <div class="an-balance-bars">
-        <span class="an-bar"><i style="width:${total ? (perLetter.A/total*100) : 0}%"></i>A · ${perLetter.A}</span>
-        <span class="an-bar an-bar-b"><i style="width:${total ? (perLetter.B/total*100) : 0}%"></i>B · ${perLetter.B}</span>
-        <span class="an-bar an-bar-c"><i style="width:${total ? (perLetter.C/total*100) : 0}%"></i>C · ${perLetter.C}</span>
+        <span class="an-bar"><i style="width:${total ? (perFamily.LOWER/total*100) : 0}%"></i>Низ · ${perFamily.LOWER}</span>
+        <span class="an-bar an-bar-b"><i style="width:${total ? (perFamily.UPPER/total*100) : 0}%"></i>Верх · ${perFamily.UPPER}</span>
+        <span class="an-bar an-bar-c"><i style="width:${total ? ((perFamily.MOBILITY + perFamily.FULL_BODY)/total*100) : 0}%"></i>Мобильность / всё тело · ${perFamily.MOBILITY + perFamily.FULL_BODY}</span>
       </div>
     </div>
   `;
@@ -902,7 +1109,12 @@ function renderReportView() {
 
 function calendarLabel(entry) {
   if (!entry) return "";
-  if (entry.type === "session") return `Тренировка ${entry.letter}`;
+  if (entry.type === "session") return entry.label || `Тренировка ${entry.letter}`;
+  if (entry.type === "run") return "Бег";
+  if (entry.type === "walk") return "Прогулка";
+  if (entry.type === "stretch") return "Растяжка";
+  if (entry.type === "mobility") return "Мобильность";
+  if (entry.type === "gym") return `Зал · ${{ LOWER: "Низ", UPPER: "Верх", MOBILITY: "Мобильность", FULL_BODY: "Всё тело", unknown: "не помню" }[entry.family] || "не помню"}`;
   if (entry.type === "cardio") return "Кардио / плавание";
   if (entry.type === "other") return "Другая активность";
   if (entry.type === "rest") return "Отдых";
@@ -947,7 +1159,7 @@ function renderCalendar() {
   for (let day = 1; day <= daysInMonth; day++) {
     const d = new Date(year, month, day);
     const key = dateKey(d);
-    const entry = state.calendar[key];
+    const entry = getCalendarEntry(key);
     const isFuture = d > new Date();
     let cls = "cal-day";
     if (entry) cls += ` cal-${entry.type}${entry.type === "session" ? " cal-letter-" + entry.letter : ""}`;
@@ -974,29 +1186,21 @@ function renderCalendar() {
   }
   chooser.classList.remove("hidden");
   const k = state.calendarOpenDay;
-  const entry = state.calendar[k];
+  const entry = getCalendarEntry(k);
   chooser.innerHTML = `<span class="cal-chooser-date">${k}</span>`;
-  if (entry && entry.type === "session") {
-    chooser.appendChild(el(`<span class="cal-chooser-note">Тренировка ${entry.letter} — уже записана автоматически</span>`));
-  }
-  const opts = [["cardio", "Кардио / плавание"], ["other", "Другое"], ["rest", "Отдых"]];
-  opts.forEach(([type, label]) => {
-    const b = el(`<button type="button" class="${entry && entry.type === type ? "active" : ""}">${label}</button>`);
-    b.addEventListener("click", () => setCalendarDay(k, type));
-    chooser.appendChild(b);
-  });
-  if (entry) {
-    const clearBtn = el(`<button type="button" class="cal-clear">Очистить день</button>`);
-    clearBtn.addEventListener("click", () => setCalendarDay(k, null));
-    chooser.appendChild(clearBtn);
-  }
+  if (entry && entry.type === "session") chooser.appendChild(el(`<span class="cal-chooser-note">${calendarLabel(entry)} — дата меняется в архиве тренировок</span>`));
+  const editBtn = el(`<button type="button">${state.manualActivities[k] ? "Изменить активность" : "Отметить активность"}</button>`);
+  editBtn.addEventListener("click", () => openActivityEditor(k));
+  chooser.appendChild(editBtn);
 }
 
 function render() {
   renderTop();
-  renderDaySwitcher();
+  renderHome();
   renderModePicker();
   renderVibePicker();
+  renderAccentPicker();
+  renderZonePicker();
   renderUndoBanner();
   renderBlocks();
   renderCalendar();
@@ -1031,8 +1235,18 @@ function initExtras() {
 
   const navHistoryBtn = document.getElementById("nav-history-btn");
   if (navHistoryBtn) navHistoryBtn.addEventListener("click", () => showView("history"));
+  const navHomeBtn = document.getElementById("nav-home-btn");
+  if (navHomeBtn) navHomeBtn.addEventListener("click", () => showView("home"));
+  const homeActivityBtn = document.getElementById("home-activity-btn");
+  if (homeActivityBtn) homeActivityBtn.addEventListener("click", () => openActivityEditor());
+  const activityCloseBtn = document.getElementById("activity-close-btn");
+  if (activityCloseBtn) activityCloseBtn.addEventListener("click", closeActivityEditor);
+  const activitySaveBtn = document.getElementById("activity-save-btn");
+  if (activitySaveBtn) activitySaveBtn.addEventListener("click", saveActivityEditor);
+  const activityDeleteBtn = document.getElementById("activity-delete-btn");
+  if (activityDeleteBtn) activityDeleteBtn.addEventListener("click", deleteActivityEditor);
   const backToWorkoutBtn = document.getElementById("back-to-workout-btn");
-  if (backToWorkoutBtn) backToWorkoutBtn.addEventListener("click", () => showView("workout"));
+  if (backToWorkoutBtn) backToWorkoutBtn.addEventListener("click", () => showView("home"));
   const backToHistoryBtn = document.getElementById("back-to-history-btn");
   if (backToHistoryBtn) backToHistoryBtn.addEventListener("click", () => showView("history"));
 }
@@ -1046,13 +1260,13 @@ function initSplash() {
 
   if (dateEl) dateEl.textContent = formatDate();
   if (nextEl) {
-    const label = SESSION_DEFS[state.session.letter] ? SESSION_DEFS[state.session.letter].label : "";
-    nextEl.innerHTML = `Сегодня по очереди: <strong>${state.session.letter} · ${label}</strong>`;
+    nextEl.innerHTML = `Сегодня можно выбрать: <strong>низ, верх, мобильность или всё тело</strong>`;
   }
   if (startBtn) {
     startBtn.addEventListener("click", () => {
       splash.classList.add("splash-hidden");
       document.body.classList.remove("splash-open");
+      showView("home");
     });
   }
 }
@@ -1073,6 +1287,8 @@ function withTransition(mutateFn) {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  const sessionDate = document.getElementById("session-date");
+  if (sessionDate) sessionDate.value = dateKey(new Date());
   render();
   initFinishButton();
   initExtras();
