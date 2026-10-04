@@ -534,7 +534,214 @@ function generateFullBodySession(mode, vibe, accents, zone) {
   }, accents, zone);
 }
 
-function generateSession(family, mode, vibe, accents, zone) {
+const FOCUS_DEFS = {
+  UPPER_PUSH_SHOULDERS: { family: "UPPER", label: "Грудь, плечи и трицепс", kind: "strength" },
+  UPPER_PULL_POSTURE: { family: "UPPER", label: "Спина, задние дельты и осанка", kind: "strength", healthyBack: true },
+  UPPER_ARMS_DELTS: { family: "UPPER", label: "Руки и дельты", kind: "strength", healthyBack: true },
+  LOWER_GLUTES_POSTERIOR: { family: "LOWER", label: "Ягодицы и задняя цепь", kind: "strength" },
+  LOWER_QUADS_CALVES: { family: "LOWER", label: "Квадрицепс и икры", kind: "strength" },
+  LOWER_UNILATERAL: { family: "LOWER", label: "Односторонняя работа и выпады", kind: "strength" },
+  MOBILITY_UPPER_POSTURE: { family: "MOBILITY", label: "Плечи, грудной отдел и осанка", kind: "strength", healthyBack: true },
+  MOBILITY_LOWER_JOINTS: { family: "MOBILITY", label: "Тазобедренные, голеностоп и колени", kind: "strength" },
+  MOBILITY_RECOVERY: { family: "MOBILITY", label: "Сила и восстановление всего тела", kind: "strength" },
+  FULL_STRENGTH: { family: "FULL_BODY", label: "Всё тело · силовая", kind: "strength" },
+  FULL_RETURN: { family: "FULL_BODY", label: "Всё тело · возвращение", kind: "strength" },
+  FULL_STRENGTH_MOBILITY: { family: "FULL_BODY", label: "Всё тело · сила и мобильность", kind: "strength" },
+};
+
+const DEFAULT_FOCUS_BY_FAMILY = {
+  UPPER: "UPPER_PULL_POSTURE",
+  LOWER: "LOWER_GLUTES_POSTERIOR",
+  MOBILITY: "MOBILITY_RECOVERY",
+  FULL_BODY: "FULL_STRENGTH",
+};
+
+function exerciseZone(exercise) {
+  if (exercise.equipmentZone) return exercise.equipmentZone;
+  return addRowMetadata({ id: exercise.id }, "sets", "", 0).equipmentZone;
+}
+
+function focusedPool(focusId, zone, sections) {
+  return EXERCISE_LIBRARY_LIST.filter((exercise) => {
+    if (exercise.excludedDefault || (exercise.autoEligible === false && !(sections || []).includes("calisthenics"))) return false;
+    if (!Array.isArray(exercise.focusIds) || !exercise.focusIds.includes(focusId)) return false;
+    if (sections && !sections.includes(exercise.section)) return false;
+    return !zone || zone === "any" || exerciseZone(exercise) === zone;
+  });
+}
+
+function getFocusZoneAvailability(focusId, zone) {
+  const focus = FOCUS_DEFS[focusId];
+  const effectiveZone = zone || "any";
+  if (!focus) return { available: false, count: 0, warning: "Выбери направление тренировки." };
+  const strength = focusedPool(focusId, effectiveZone, ["anchors", "rotation"]);
+  // A whole-workout zone is only honest when it can populate the agreed
+  // three anchors plus three rotations. A partial match stays unavailable
+  // instead of silently producing a mixed-equipment strength block.
+  const required = focus.kind === "strength" ? 6 : 1;
+  const available = effectiveZone === "any" || strength.length >= required;
+  return {
+    available,
+    count: strength.length,
+    required,
+    warning: available ? "" : `В зоне «${effectiveZone}» пока недостаточно вариантов для 3 основных и 3 ротаций. Выбери «Любая зона» или другую зону.`,
+  };
+}
+
+function getBlockZoneAvailability(rows, focusId, zone) {
+  if (!zone || zone === "any") return { available: true, count: (rows || []).length };
+  const pendingRows = (rows || []).filter(Boolean);
+  const available = pendingRows.every((row) => {
+    const options = getSwapOptions(row.id, row.originalId, focusId, zone, "zone");
+    return options.some((exercise) => exerciseZone(exercise) === zone);
+  });
+  return { available, count: pendingRows.length };
+}
+
+function focusedRows(pool, count, usedIds, slotKey, slotTitle, format, usedPatterns = null, vibe = "comfort") {
+  const picked = [];
+  const vibeScore = (exercise) => {
+    if (vibe === "strong") return exercise.section === "anchors" ? 6 : exercise.equipmentZone === "machines" ? 2 : 0;
+    if (vibe === "comfort") return ["machines", "dumbbells"].includes(exercise.equipmentZone) ? 5 : 0;
+    if (vibe === "pump") return exercise.section === "rotation" ? 5 : ["cable", "dumbbells"].includes(exercise.equipmentZone) ? 2 : 0;
+    if (vibe === "mobility") return ["floor", "bodyweight", "dumbbells"].includes(exercise.equipmentZone) ? 5 : 0;
+    if (vibe === "explore") return (String(exercise.id).charCodeAt(String(exercise.id).length - 1) % 5) + 1;
+    if (vibe === "fun") return ["landmine", "dumbbells", "bodyweight"].includes(exercise.equipmentZone) ? 4 : 0;
+    return 0;
+  };
+  const sorted = pool.slice().sort((a, b) => vibeScore(b) - vibeScore(a) || (b.prefWeight || 0) - (a.prefWeight || 0) || (b.setupWeight || 0) - (a.setupWeight || 0));
+  for (const exercise of sorted) {
+    if (picked.length >= count || usedIds.has(exercise.id)) continue;
+    const pattern = exercise.movementPattern || exercise.tag;
+    if (picked.some((row) => (EXERCISES[row.id].movementPattern || EXERCISES[row.id].tag) === pattern)) continue;
+    if (usedPatterns && usedPatterns.has(pattern)) continue;
+    usedIds.add(exercise.id);
+    if (usedPatterns) usedPatterns.add(pattern);
+    picked.push(addRowMetadata({ slotKey, slotTitle, id: exercise.id, originalId: exercise.id }, format || "sets", "", 0));
+  }
+  return picked;
+}
+
+function focusedSupportPool(focus, section) {
+  const ids = focus.family === "UPPER"
+    ? (section === "prep" ? ["EX119", "EX120", "EX125", "EX173"] : ["EX167", "EX177", "EX178", "EX179"])
+    : focus.family === "LOWER"
+      ? (section === "prep" ? ["EX122", "EX123", "EX124", "EX174", "EX185"] : ["EX012", "EX017", "EX147"])
+      : ["EX119", "EX120", "EX122", "EX123", "EX124", "EX173", "EX174"];
+  return ids.map((id) => EXERCISES[id]).filter(Boolean);
+}
+
+// Optional accents are deliberate mini-blocks, not an extension of warm-up.
+// Each focus gets a small safe fallback pool so an enabled accent never renders
+// as an empty button just because its primary library has no exact tag yet.
+function focusedAccentPool(focusId, focus, accent, zone) {
+  const directSections = accent === "calisthenics" ? ["calisthenics"]
+    : accent === "healthyBack" ? ["healthyBack"]
+      : ["prep", "activation"];
+  const direct = focusedPool(focusId, zone, directSections);
+  const byFamily = {
+    LOWER: {
+      mobility: ["EX174", "EX185", "EX121", "EX137"],
+      calisthenics: ["EX183", "EX184", "EX186"],
+      healthyBack: ["EX062", "EX171", "EX119", "EX120"],
+    },
+    UPPER: {
+      mobility: ["EX125", "EX121", "EX172", "EX178"],
+      calisthenics: ["EX180", "EX181", "EX166", "EX168"],
+      healthyBack: ["EX062", "EX171", "EX119", "EX120"],
+    },
+    MOBILITY: {
+      mobility: ["EX123", "EX124", "EX185", "EX121"],
+      calisthenics: ["EX183", "EX184", "EX186"],
+      healthyBack: ["EX062", "EX171", "EX119", "EX120"],
+    },
+    FULL_BODY: {
+      mobility: ["EX125", "EX174", "EX185", "EX121"],
+      calisthenics: ["EX183", "EX180", "EX186"],
+      healthyBack: ["EX062", "EX171", "EX119", "EX120"],
+    },
+  };
+  const fallback = ((byFamily[focus.family] || {})[accent] || []).map((id) => EXERCISES[id]).filter(Boolean);
+  return [...direct, ...fallback].filter((exercise, index, all) => all.findIndex((item) => item.id === exercise.id) === index);
+}
+
+function focusedStrengthPool(focusId, focus, zone) {
+  const direct = focusedPool(focusId, zone, ["anchors", "rotation"]);
+  const fallbackIds = {
+    UPPER_PUSH_SHOULDERS: ["EX069", "EX071", "EX083", "EX087", "EX076", "EX081", "EX089", "EX092", "EX163"],
+    UPPER_PULL_POSTURE: ["EX050", "EX056", "EX064", "EX065", "EX094", "EX098", "EX171", "EX165"],
+    UPPER_ARMS_DELTS: ["EX089", "EX094", "EX083", "EX087", "EX092", "EX098", "EX171", "EX076"],
+    LOWER_GLUTES_POSTERIOR: ["EX001", "EX019", "EX024", "EX009", "EX013", "EX040", "EX175", "EX182"],
+    LOWER_QUADS_CALVES: ["EX030", "EX164", "EX035", "EX040", "EX041", "EX046", "EX175", "EX176"],
+    LOWER_UNILATERAL: ["EX040", "EX175", "EX176", "EX041", "EX013", "EX030", "EX024", "EX046"],
+    MOBILITY_UPPER_POSTURE: ["EX050", "EX069", "EX071", "EX083", "EX064", "EX065", "EX076", "EX163"],
+    MOBILITY_LOWER_JOINTS: ["EX030", "EX035", "EX040", "EX041", "EX046", "EX024", "EX013", "EX175"],
+    MOBILITY_RECOVERY: ["EX030", "EX050", "EX069", "EX163", "EX164", "EX165", "EX040", "EX175"],
+    FULL_STRENGTH: ["EX030", "EX050", "EX069", "EX163", "EX164", "EX165", "EX040", "EX175"],
+    FULL_RETURN: ["EX030", "EX050", "EX069", "EX163", "EX164", "EX165", "EX040", "EX175"],
+    FULL_STRENGTH_MOBILITY: ["EX030", "EX050", "EX069", "EX163", "EX164", "EX165", "EX040", "EX175"],
+  }[focusId] || [];
+  const fallback = fallbackIds.map((id) => EXERCISES[id]).filter(Boolean).filter((exercise) => !zone || zone === "any" || exerciseZone(exercise) === zone);
+  return [...direct, ...fallback].filter((exercise, index, all) => all.findIndex((item) => item.id === exercise.id) === index);
+}
+
+function focusedCorePool(focusId) {
+  const direct = focusedPool(focusId, "any", ["core"]);
+  const fallback = ["EX101", "EX105", "EX108", "EX109", "EX110"].map((id) => EXERCISES[id]).filter(Boolean);
+  return [...direct, ...fallback].filter((exercise, index, all) => all.findIndex((item) => item.id === exercise.id) === index);
+}
+
+function generateFocusedSession(focusId, mode, vibe, accents, zone) {
+  const focus = FOCUS_DEFS[focusId] || FOCUS_DEFS[DEFAULT_FOCUS_BY_FAMILY.LOWER];
+  const rank = MODE_RANK[mode] || MODE_RANK.NORMAL;
+  const activeAccents = globalThis.MoyaSilaTrainingState ? globalThis.MoyaSilaTrainingState.normalizeAccents(accents) : { mobility: false, calisthenics: false };
+  const usedIds = new Set();
+  const availability = getFocusZoneAvailability(focusId, zone);
+  const strengthPool = focusedStrengthPool(focusId, focus, zone);
+  const prepPool = [...focusedPool(focusId, "any", ["prep"]), ...focusedSupportPool(focus, "prep")];
+  const activationPool = [...focusedPool(focusId, "any", ["activation"]), ...focusedSupportPool(focus, "activation")];
+  const cooldownPool = [...focusedPool(focusId, "any", ["cooldown"]), ...focusedSupportPool(focus, "prep")];
+  const corePool = focusedCorePool(focusId);
+  const healthyBackPool = focusedAccentPool(focusId, focus, "healthyBack", zone);
+  // Fixed session structure agreed for every detailed plan and every mode.
+  // Mode changes the selection, not the number of essential blocks.
+  const strengthPlan = { anchors: 3, rotation: 3 };
+  const strengthPatterns = new Set();
+  const activeVibe = VIBES.includes(vibe) ? vibe : "comfort";
+  const anchors = focus.kind === "strength" ? focusedRows(strengthPool, strengthPlan.anchors, usedIds, "anchors", "Основные упражнения", "sets", strengthPatterns, activeVibe) : [];
+  const rotation = focus.kind === "strength" ? focusedRows(strengthPool, strengthPlan.rotation, usedIds, "rotation", "Ротация", "sets", strengthPatterns, activeVibe) : [];
+  const prep = focusedRows(prepPool, 4, usedIds, "prep", "Подготовка", "checklist");
+  const activation = focusedRows(activationPool, 3, usedIds, "activation", "Активация", "checklist");
+  const core = focus.kind === "strength" ? focusedRows(corePool, 2, usedIds, "core", "Кор · круг", "circuit") : [];
+  const accentCount = 3;
+  // Optional sections have their own mini-programs. Their length must not be
+  // reduced merely because preparation used a similar movement earlier.
+  const healthyBack = focus.healthyBack || activeAccents.healthyBack ? focusedRows(healthyBackPool, accentCount, new Set(), "healthyBack", "Здоровая спина", "sets") : [];
+  const mobilityAccent = activeAccents.mobility ? focusedRows(focusedAccentPool(focusId, focus, "mobility", zone), accentCount, new Set(), "mobilityAccent", "Мобильный акцент", "sets") : [];
+  const calisthenics = activeAccents.calisthenics ? focusedRows(focusedAccentPool(focusId, focus, "calisthenics", zone), accentCount, new Set(), "calisthenics", "Калистеника · прогрессия", "sets") : [];
+  // Cooldown has its own short sequence. It may intentionally revisit a
+  // mobility drill from preparation, so it does not lose its required length.
+  const cooldown = focusedRows(cooldownPool, 3, new Set(), "cooldown", "Заминка / роллер", "checklist");
+
+  return {
+    letter: focus.family,
+    family: focus.family,
+    focusId,
+    focus: focus.label,
+    label: FAMILY_DEFS[focus.family].label,
+    mode,
+    vibe: activeVibe,
+    zone: zone || "any",
+    zoneWarning: availability.warning,
+    accents: activeAccents,
+    prep, activation, anchors, rotation, core, healthyBack, mobilityAccent, calisthenics, cooldown,
+    warmup: prep,
+    fun: [],
+  };
+}
+
+function generateSession(family, mode, vibe, accents, zone, requestedFocusId) {
+  if (requestedFocusId && FOCUS_DEFS[requestedFocusId]) return generateFocusedSession(requestedFocusId, mode, vibe, accents, zone);
   const normalized = globalThis.MoyaSilaTrainingState && globalThis.MoyaSilaTrainingState.normalizeFamily(family);
   const activeFamily = normalized || "LOWER";
   if (activeFamily === "MOBILITY") return decorateSession(generateMobilitySession(mode, vibe), accents, zone);
@@ -565,9 +772,14 @@ function nextLetterAfter(letter) {
 
 // Полный список реальных вариантов на замену + гарантированное исходное упражнение,
 // чтобы всегда можно было вернуться назад одним тапом.
-function getSwapOptions(currentId, originalId, isPrepSlot, zone) {
+function getSwapOptions(currentId, originalId, focusIdOrPrep, zoneOrScope, requestedScope) {
   const current = EXERCISES[currentId];
   if (!current) return [];
+  const focusedRequest = typeof focusIdOrPrep === "string" && FOCUS_DEFS[focusIdOrPrep];
+  const isPrepSlot = focusedRequest ? ["prep", "activation", "cooldown"].includes(current.section) : Boolean(focusIdOrPrep);
+  const focusId = focusedRequest ? focusIdOrPrep : null;
+  const zone = focusedRequest ? zoneOrScope : zoneOrScope;
+  const scope = focusedRequest ? (requestedScope || "all") : "all";
   const relatedTags = {
     back: ["back", "biceps"],
     shoulders: ["shoulders", "chest", "triceps"],
@@ -582,9 +794,13 @@ function getSwapOptions(currentId, originalId, isPrepSlot, zone) {
   }[current.tag] || [current.tag];
   const pool = EXERCISE_LIBRARY_LIST.filter((ex) => {
     if (!relatedTags.includes(ex.tag) || ex.excludedDefault) return false;
+    // In the broad replacement panel, preserve the target muscle/pattern but
+    // deliberately allow another equipment method when the gym is busy.
+    if (focusId && scope === "zone" && (!Array.isArray(ex.focusIds) || !ex.focusIds.includes(focusId))) return false;
+    if (ex.autoEligible === false && ex.id !== currentId && ex.id !== originalId) return false;
     if (!isPrepSlot && (ex.recovery || ex.role === "warm-up" || ex.role === "cardio" || ex.role === "recovery" || ex.role === "optional-activity")) return false;
-    if (zone && zone !== "any") {
-      const rowZone = addRowMetadata({ id: ex.id }, "sets", "", 0).equipmentZone;
+    if ((scope === "zone" || !focusedRequest) && zone && zone !== "any") {
+      const rowZone = exerciseZone(ex);
       if (rowZone !== zone && ex.id !== currentId && ex.id !== originalId) return false;
     }
     return true;
@@ -592,7 +808,7 @@ function getSwapOptions(currentId, originalId, isPrepSlot, zone) {
   const preferredIds = [current.alt1, current.alt2].filter(Boolean);
   const scored = pool.map((ex) => ({
     ex,
-    score: (preferredIds.includes(ex.id) ? 5 : 0) + ex.prefWeight * 2 + ex.setupWeight,
+    score: (preferredIds.includes(ex.id) ? 5 : 0) + (ex.movementPattern === current.movementPattern ? 4 : 0) + ex.prefWeight * 2 + ex.setupWeight,
   }));
   scored.sort((a, b) => b.score - a.score);
   const ids = scored.slice(0, 11).map((s) => s.ex.id);

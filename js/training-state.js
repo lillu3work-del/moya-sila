@@ -13,6 +13,9 @@
     "очередь_A_B_C",
     "что_было_в_прошлый_раз",
     "ручные_активности_календаря",
+    "выбранные_акценты",
+    "выбранная_зона",
+    "незавершённая_тренировка",
   ]);
 
   function getFamilyForLegacyLetter(letter) {
@@ -27,18 +30,107 @@
     return {
       mobility: Boolean(value && value.mobility),
       calisthenics: Boolean(value && value.calisthenics),
+      healthyBack: Boolean(value && value.healthyBack),
     };
   }
 
   function toggleAccent(accents, name) {
     const next = normalizeAccents(accents);
-    if (name === "mobility" || name === "calisthenics") next[name] = !next[name];
+    if (["mobility", "calisthenics", "healthyBack"].includes(name)) next[name] = !next[name];
     return next;
   }
 
   function normalizeZone(value) {
     const zones = ["any", "dumbbells", "landmine", "cable", "machines", "bodyweight", "floor"];
     return zones.includes(value) ? value : "any";
+  }
+
+  function toLocalDateKey(value) {
+    const date = value instanceof Date ? value : new Date(value);
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+    return `${date.getFullYear()}-${month}-${day}`;
+  }
+
+  function createActiveWorkout(session, plannedDate, now) {
+    const current = now instanceof Date ? now : new Date(now || Date.now());
+    const timestamp = current.toISOString();
+    return {
+      status: "in_progress",
+      startedAt: timestamp,
+      plannedDate: /^\d{4}-\d{2}-\d{2}$/.test(plannedDate || "") ? plannedDate : toLocalDateKey(current),
+      lastOpenedAt: timestamp,
+      session,
+    };
+  }
+
+  function normalizeActiveWorkout(value, legacySession, legacyStatus, now) {
+    if (value && value.status === "in_progress" && value.session) {
+      const current = now instanceof Date ? now : new Date(now || Date.now());
+      return {
+        ...value,
+        plannedDate: /^\d{4}-\d{2}-\d{2}$/.test(value.plannedDate || "")
+          ? value.plannedDate
+          : toLocalDateKey(value.startedAt || current),
+        startedAt: value.startedAt || current.toISOString(),
+        lastOpenedAt: value.lastOpenedAt || value.startedAt || current.toISOString(),
+      };
+    }
+
+    const hasCheckedRows = Object.values(legacyStatus || {}).some((status) => status === "done" || status === "skip");
+    return legacySession && hasCheckedRows
+      ? createActiveWorkout(legacySession, toLocalDateKey(now || new Date()), now)
+      : null;
+  }
+
+  function getActiveWorkoutProgress(activeWorkout, status, trackableCount) {
+    const total = Math.max(0, Number(trackableCount) || 0);
+    const done = Math.min(
+      total,
+      Object.values(status || {}).filter((value) => value === "done" || value === "skip" || value === "skipped").length,
+    );
+    return { done, total, percent: total ? Math.round((done / total) * 100) : 0 };
+  }
+
+  function shouldOfferFinishReminder(activeWorkout, status, trackableCount, now) {
+    if (!activeWorkout || activeWorkout.status !== "in_progress") return false;
+    const current = now instanceof Date ? now : new Date(now || Date.now());
+    const started = new Date(activeWorkout.startedAt);
+    if (Number.isNaN(started.getTime()) || current.getTime() - started.getTime() < 12 * 60 * 60 * 1000) return false;
+    const progress = getActiveWorkoutProgress(activeWorkout, status, trackableCount);
+    return progress.total > 0 && progress.percent >= 80;
+  }
+
+  function shouldKeepActiveSession(activeWorkout, status) {
+    if (!activeWorkout || activeWorkout.status !== "in_progress") return false;
+    return Object.values(status || {}).some((value) => value === "done" || value === "skipped" || value === "skip");
+  }
+
+  function escapeHtml(value) {
+    return String(value ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
+  }
+
+  function filterBackupRecords(records, expectedShapes) {
+    if (!records || typeof records !== "object" || Array.isArray(records)) return {};
+    const matchesShape = (value, shape) => {
+      if (shape === "array") return Array.isArray(value);
+      if (shape === "object") return value !== null && typeof value === "object" && !Array.isArray(value);
+      return typeof value === shape;
+    };
+    return Object.fromEntries(
+      Object.entries(records).filter(([label, value]) => expectedShapes[label] && matchesShape(value, expectedShapes[label])),
+    );
+  }
+
+  function getSessionGenerationRequest(session, mode, vibe, accents, zone) {
+    const family = normalizeFamily(session && (session.family || session.letter)) || "LOWER";
+    const fallbackFocus = { LOWER: "LOWER_GLUTES_POSTERIOR", UPPER: "UPPER_PULL_POSTURE", MOBILITY: "MOBILITY_RECOVERY", FULL_BODY: "FULL_STRENGTH" };
+    return [family, mode, vibe, normalizeAccents(accents), normalizeZone(zone), (session && session.focusId) || fallbackFocus[family]];
   }
 
   function lastFamilyFromLog(log) {
@@ -143,6 +235,15 @@
     normalizeAccents,
     toggleAccent,
     normalizeZone,
+    toLocalDateKey,
+    createActiveWorkout,
+    normalizeActiveWorkout,
+    getActiveWorkoutProgress,
+    shouldOfferFinishReminder,
+    shouldKeepActiveSession,
+    escapeHtml,
+    filterBackupRecords,
+    getSessionGenerationRequest,
     getRecommendation,
     getMonthStats,
     setManualActivity,

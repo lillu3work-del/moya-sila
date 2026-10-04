@@ -13,8 +13,9 @@ const STORAGE_MANUAL_ACTIVITIES = "moya-sila-manual-activities-v1";
 const STORAGE_DRAFT_WEIGHT_IDS = "moya-sila-draft-weight-ids-v1";
 const STORAGE_ACCENTS = "moya-sila-accents-v1";
 const STORAGE_ZONE = "moya-sila-zone-v1";
+const STORAGE_ACTIVE_WORKOUT = "moya-sila-active-workout-v1";
 
-const ALL_STORAGE_KEYS = [STORAGE_MODE, STORAGE_SESSION, STORAGE_STATUS, STORAGE_HISTORY, STORAGE_LOG, STORAGE_VIBE, STORAGE_CALENDAR, STORAGE_UNDO, STORAGE_MANUAL_ACTIVITIES, STORAGE_DRAFT_WEIGHT_IDS, STORAGE_ACCENTS, STORAGE_ZONE, "moya-sila-rotation-v1", "moya-sila-last-by-letter-v1", "moya-sila-last-by-family-v1"];
+const ALL_STORAGE_KEYS = [STORAGE_MODE, STORAGE_SESSION, STORAGE_STATUS, STORAGE_HISTORY, STORAGE_LOG, STORAGE_VIBE, STORAGE_CALENDAR, STORAGE_UNDO, STORAGE_MANUAL_ACTIVITIES, STORAGE_DRAFT_WEIGHT_IDS, STORAGE_ACCENTS, STORAGE_ZONE, STORAGE_ACTIVE_WORKOUT, "moya-sila-rotation-v1", "moya-sila-last-by-letter-v1", "moya-sila-last-by-family-v1"];
 
 function makeId() {
   return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
@@ -56,6 +57,8 @@ const state = {
   draftWeightIds: loadJSON(STORAGE_DRAFT_WEIGHT_IDS, []),
   accents: MoyaSilaTrainingState.normalizeAccents(loadJSON(STORAGE_ACCENTS, {})),
   zone: MoyaSilaTrainingState.normalizeZone(loadJSON(STORAGE_ZONE, "any")),
+  activeWorkout: null,
+  selectedFamily: null,
   blockZones: {},
   lastUndo: loadJSON(STORAGE_UNDO, null),
   view: "home", // 'home' | 'workout' | 'history' | 'report'
@@ -67,13 +70,52 @@ const state = {
   activityEditor: { key: null, type: "other", family: "unknown" },
   timer: { key: null, seconds: 0, running: false, interval: null },
 };
+state.activeWorkout = MoyaSilaTrainingState.normalizeActiveWorkout(loadJSON(STORAGE_ACTIVE_WORKOUT, null), state.session, state.status, new Date());
+if (state.activeWorkout) {
+  state.session = state.activeWorkout.session;
+  saveJSON(STORAGE_ACTIVE_WORKOUT, state.activeWorkout);
+}
 if (!state.session) {
   state.session = generateSession("LOWER", state.mode, state.vibe);
   saveJSON(STORAGE_SESSION, state.session);
 }
 state.session.accents = MoyaSilaTrainingState.normalizeAccents(state.session.accents || state.accents);
 state.session.zone = MoyaSilaTrainingState.normalizeZone(state.session.zone || state.zone);
+if (state.zone !== "any" && state.session.focusId && !getFocusZoneAvailability(state.session.focusId, state.zone).available) {
+  state.zone = "any";
+  state.session.zone = "any";
+  saveJSON(STORAGE_ZONE, state.zone);
+}
+if (!state.session.prep && state.session.warmup) {
+  const legacyWarmup = state.session.warmup;
+  state.session.prep = legacyWarmup.slice(0, 4);
+  state.session.activation = legacyWarmup.slice(4, 7);
+  state.session.mobilityAccent = legacyWarmup.slice(7, 10);
+  legacyWarmup.forEach((_, index) => {
+    const oldKey = slotKey("warmup", index);
+    const mappedGroup = index < 4 ? "prep" : index < 7 ? "activation" : "mobilityAccent";
+    const mappedIndex = index < 4 ? index : index < 7 ? index - 4 : index - 7;
+    if (state.status[oldKey]) {
+      state.status[slotKey(mappedGroup, mappedIndex)] = state.status[oldKey];
+      delete state.status[oldKey];
+    }
+  });
+  saveJSON(STORAGE_STATUS, state.status);
+}
+// Upgrade an already-open workout from older versions: if an accent had been
+// selected but its old generator returned no rows, add only that missing block.
+// The existing workout, marks and substitutions stay untouched.
+if (Object.values(state.accents).some(Boolean)) {
+  const accentPreview = generateSession(...MoyaSilaTrainingState.getSessionGenerationRequest(state.session, state.mode, state.vibe, state.accents, state.zone));
+  [["mobilityAccent", "mobility"], ["calisthenics", "calisthenics"], ["healthyBack", "healthyBack"]].forEach(([group, accent]) => {
+    if (state.accents[accent] && !(state.session[group] || []).length) state.session[group] = accentPreview[group] || [];
+  });
+}
 saveJSON(STORAGE_SESSION, state.session);
+if (state.activeWorkout) {
+  state.activeWorkout.session = state.session;
+  saveJSON(STORAGE_ACTIVE_WORKOUT, state.activeWorkout);
+}
 
 function selectedSessionDateKey() {
   const input = document.getElementById("session-date");
@@ -82,13 +124,15 @@ function selectedSessionDateKey() {
 if (typeof localStorage.getItem(STORAGE_MODE) !== "string") saveJSON(STORAGE_MODE, state.mode);
 
 const BLOCKS = [
-  { group: "warmup", title: "Разминка", cls: "block-warmup" },
+  { group: "prep", title: "Подготовка", cls: "block-warmup" },
+  { group: "activation", title: "Активация", cls: "block-warmup" },
   { group: "anchors", title: "Основные", cls: "block-main" },
   { group: "rotation", title: "Ротация / любимое", cls: "block-rotation" },
   { group: "core", title: "Кор", cls: "block-core" },
+  { group: "healthyBack", title: "Здоровая спина", cls: "block-mobility" },
   { group: "mobilityAccent", title: "Мобильный акцент", cls: "block-mobility" },
   { group: "calisthenics", title: "Калистеника · прогрессия", cls: "block-calisthenics" },
-  { group: "cooldown", title: "Растяжка / роллер", cls: "block-cooldown" },
+  { group: "cooldown", title: "Заминка / роллер", cls: "block-cooldown" },
 ];
 
 function slotKey(group, index) {
@@ -121,7 +165,14 @@ function setStatus(key, value) {
   if (state.status[key] === value) delete state.status[key];
   else state.status[key] = value;
   saveJSON(STORAGE_STATUS, state.status);
+  persistActiveWorkout();
   render();
+}
+
+function persistActiveWorkout() {
+  if (!state.activeWorkout) return;
+  state.activeWorkout = { ...state.activeWorkout, session: state.session, lastOpenedAt: new Date().toISOString() };
+  saveJSON(STORAGE_ACTIVE_WORKOUT, state.activeWorkout);
 }
 
 function toggleExpand(key) {
@@ -141,6 +192,7 @@ function applySwap(group, index, newId) {
   const row = getRow(group, index);
   row.id = newId;
   saveJSON(STORAGE_SESSION, state.session);
+  persistActiveWorkout();
   state.swapOpenKey = null;
   render();
 }
@@ -149,8 +201,9 @@ function applySwap(group, index, newId) {
 // без открытия списка (список открывается отдельно через "Заменить упражнение →").
 function quickSwap(group, index) {
   const row = getRow(group, index);
-  const isPrepSlot = group === "warmup" || group === "cooldown";
-  const options = getSwapOptions(row.id, row.originalId, isPrepSlot, state.blockZones[group] || "any");
+  // The quick action is a real replacement, not a hidden zone lock: if a
+  // machine opened up, Katya can move to it without first resetting a filter.
+  const options = getSwapOptions(row.id, row.originalId, state.session.focusId || false, "any", "all");
   if (options.length < 2) return;
   const ids = options.map((o) => o.id);
   const curIdx = ids.indexOf(row.id);
@@ -161,11 +214,16 @@ function quickSwap(group, index) {
 }
 
 function changeMode(mode) {
+  if (MoyaSilaTrainingState.shouldKeepActiveSession(state.activeWorkout, state.status)) {
+    window.alert("Эта тренировка уже начата, поэтому режим не меняю и отметки остаются на месте. Заверши её или начни новую тренировку с главной страницы.");
+    return;
+  }
   withTransition(() => {
     state.mode = mode;
     saveJSON(STORAGE_MODE, mode);
-    state.session = generateSession(state.session.family || state.session.letter, mode, state.vibe, state.accents, state.zone);
+    state.session = generateSession(...MoyaSilaTrainingState.getSessionGenerationRequest(state.session, mode, state.vibe, state.accents, state.zone));
     saveJSON(STORAGE_SESSION, state.session);
+    persistActiveWorkout();
     state.status = {};
     saveJSON(STORAGE_STATUS, state.status);
     clearDraftWeightIds();
@@ -175,12 +233,18 @@ function changeMode(mode) {
   });
 }
 
-function startFamilySession(family) {
+function startFamilySession(family, focusId) {
+  if (MoyaSilaTrainingState.shouldKeepActiveSession(state.activeWorkout, state.status)) {
+    const leaveCurrent = window.confirm("Текущая тренировка ещё не завершена. Начать новую и оставить старую незавершённой?");
+    if (!leaveCurrent) return;
+  }
   withTransition(() => {
-    state.session = generateSession(family, state.mode, state.vibe, state.accents, state.zone);
+    state.session = generateSession(family, state.mode, state.vibe, state.accents, state.zone, focusId);
     saveJSON(STORAGE_SESSION, state.session);
     state.status = {};
     saveJSON(STORAGE_STATUS, state.status);
+    state.activeWorkout = MoyaSilaTrainingState.createActiveWorkout(state.session, dateKey(new Date()), new Date());
+    saveJSON(STORAGE_ACTIVE_WORKOUT, state.activeWorkout);
     clearDraftWeightIds();
     state.expanded = null;
     state.swapOpenKey = null;
@@ -189,11 +253,16 @@ function startFamilySession(family) {
 }
 
 function changeVibe(vibe) {
+  if (MoyaSilaTrainingState.shouldKeepActiveSession(state.activeWorkout, state.status)) {
+    window.alert("Эта тренировка уже начата, поэтому вайб не меняю и отметки остаются на месте. Заверши её или начни новую тренировку с главной страницы.");
+    return;
+  }
   withTransition(() => {
     state.vibe = vibe;
     saveVibeState({ current: vibe });
-    state.session = generateSession(state.session.family || state.session.letter, state.mode, vibe, state.accents, state.zone);
+    state.session = generateSession(...MoyaSilaTrainingState.getSessionGenerationRequest(state.session, state.mode, vibe, state.accents, state.zone));
     saveJSON(STORAGE_SESSION, state.session);
+    persistActiveWorkout();
     state.status = {};
     saveJSON(STORAGE_STATUS, state.status);
     clearDraftWeightIds();
@@ -388,6 +457,8 @@ function finishSession() {
   saveJSON(STORAGE_STATUS, state.status);
   state.draftWeightIds = [];
   saveJSON(STORAGE_DRAFT_WEIGHT_IDS, state.draftWeightIds);
+  state.activeWorkout = null;
+  localStorage.removeItem(STORAGE_ACTIVE_WORKOUT);
   state.expanded = null;
   state.swapOpenKey = null;
   document.getElementById("session-note").value = "";
@@ -633,6 +704,9 @@ const STORAGE_KEY_LABELS = {
   [STORAGE_CALENDAR]: "календарь",
   [STORAGE_MANUAL_ACTIVITIES]: "ручные_активности_календаря",
   [STORAGE_DRAFT_WEIGHT_IDS]: "черновые_записи_весов",
+  [STORAGE_ACCENTS]: "выбранные_акценты",
+  [STORAGE_ZONE]: "выбранная_зона",
+  [STORAGE_ACTIVE_WORKOUT]: "незавершённая_тренировка",
   [STORAGE_UNDO]: "последняя_отмена",
   "moya-sila-rotation-v1": "очередь_A_B_C",
   "moya-sila-last-by-letter-v1": "что_было_в_прошлый_раз",
@@ -671,13 +745,26 @@ function exportBackup() {
 }
 
 function importBackupFile(file) {
+  if (!file || file.size > 2 * 1024 * 1024) {
+    window.alert("Этот файл слишком большой для бэкапа «Моя сила». Выбери исходный JSON-бэкап приложения.");
+    return;
+  }
   const reader = new FileReader();
   reader.onload = () => {
     try {
       const dump = JSON.parse(reader.result);
-      const readableData = dump && dump.данные ? dump.данные : dump; // подстраховка на случай другого формата файла
+      const readableData = dump && dump.данные ? dump.данные : dump;
+      const expectedShapes = {
+        режим_тренировки: "string", текущая_тренировка: "object", отметки_упражнений: "object",
+        история_весов_и_повторов: "object", журнал_завершённых_тренировок: "array", текущий_вайб: "object",
+        календарь: "object", ручные_активности_календаря: "object", черновые_записи_весов: "array",
+        выбранные_акценты: "object", выбранная_зона: "string", незавершённая_тренировка: "object",
+        последняя_отмена: "object", очередь_A_B_C: "object", что_было_в_прошлый_раз: "object",
+        что_было_в_прошлый_раз_по_формату: "object",
+      };
+      const acceptedRecords = MoyaSilaTrainingState.filterBackupRecords(readableData, expectedShapes);
       let restored = 0;
-      Object.entries(readableData).forEach(([label, value]) => {
+      Object.entries(acceptedRecords).forEach(([label, value]) => {
         const key = REVERSE_KEY_LABELS[label] || (ALL_STORAGE_KEYS.includes(label) ? label : null);
         if (!key) return;
         localStorage.setItem(key, JSON.stringify(value));
@@ -729,6 +816,10 @@ function el(html) {
   return t.content.firstElementChild;
 }
 
+function safeText(value) {
+  return MoyaSilaTrainingState.escapeHtml(value);
+}
+
 function formatDate() {
   const now = new Date();
   return `${WEEKDAYS_RU[now.getDay()]} · ${now.getDate()} ${MONTHS_RU[now.getMonth()]}`;
@@ -761,9 +852,32 @@ function renderHome() {
       ["FULL_BODY", "Общее тело", "вернуться после паузы или собрать всё"],
     ];
     grid.innerHTML = "";
+    if (state.activeWorkout) {
+      const done = MoyaSilaTrainingState.getActiveWorkoutProgress(state.activeWorkout, state.status, allTrackableRows().length);
+      const resume = el(`<button type="button" class="family-card"><span>↺</span><strong>Продолжить: ${safeText(state.session.focus || state.session.label)}</strong><small>${done.done} из ${done.total} отмечено · дата ${safeText(state.activeWorkout.plannedDate)}</small><i>Вернуться →</i></button>`);
+      resume.addEventListener("click", () => { persistActiveWorkout(); showView("workout"); });
+      grid.appendChild(resume);
+    }
+    const focusOptions = {
+      LOWER: [["LOWER_GLUTES_POSTERIOR", "Ягодицы и задняя цепь"], ["LOWER_QUADS_CALVES", "Квадрицепс и икры"], ["LOWER_UNILATERAL", "Выпады и односторонняя работа"]],
+      UPPER: [["UPPER_PUSH_SHOULDERS", "Грудь, плечи, трицепс"], ["UPPER_PULL_POSTURE", "Спина и осанка"], ["UPPER_ARMS_DELTS", "Руки и дельты"]],
+      MOBILITY: [["MOBILITY_UPPER_POSTURE", "Плечи и грудной отдел"], ["MOBILITY_LOWER_JOINTS", "Тазобедренные и голеностоп"], ["MOBILITY_RECOVERY", "Мягкое восстановление"]],
+      FULL_BODY: [["FULL_STRENGTH", "Силовое всё тело"], ["FULL_RETURN", "Возвращение после паузы"], ["FULL_STRENGTH_MOBILITY", "Сила + мобильность"]],
+    };
+    if (state.selectedFamily) {
+      const back = el(`<button type="button" class="family-card"><strong>← Выбрать другую группу</strong></button>`);
+      back.addEventListener("click", () => { state.selectedFamily = null; renderHome(); });
+      grid.appendChild(back);
+      focusOptions[state.selectedFamily].forEach(([focusId, label]) => {
+        const option = el(`<button type="button" class="family-card"><strong>${label}</strong><small>Собрать тренировку →</small></button>`);
+        option.addEventListener("click", () => startFamilySession(state.selectedFamily, focusId));
+        grid.appendChild(option);
+      });
+      return;
+    }
     cards.forEach(([family, title, desc]) => {
       const card = el(`<button type="button" class="family-card family-${family.toLowerCase()}"><span>${family === "MOBILITY" ? "◌" : family === "FULL_BODY" ? "✦" : family === "LOWER" ? "⌄" : "⌃"}</span><strong>${title}</strong><small>${desc}</small><i>Открыть →</i></button>`);
-      card.addEventListener("click", () => startFamilySession(family));
+      card.addEventListener("click", () => { state.selectedFamily = family; renderHome(); });
       grid.appendChild(card);
     });
   }
@@ -796,10 +910,54 @@ function renderVibePicker() {
 }
 
 function regenerateForOptions() {
-  state.session = generateSession(state.session.family || state.session.letter, state.mode, state.vibe, state.accents, state.zone);
+  const generated = generateSession(...MoyaSilaTrainingState.getSessionGenerationRequest(state.session, state.mode, state.vibe, state.accents, state.zone));
+  const accentGroups = [
+    ["mobilityAccent", "mobility"],
+    ["calisthenics", "calisthenics"],
+    ["healthyBack", "healthyBack"],
+  ];
+  // A plus should only add or remove its own block. Never reshuffle completed
+  // strength work or erase marks in the workout already in progress.
+  accentGroups.forEach(([group, accent]) => {
+    const isAutomaticHealthyBack = group === "healthyBack" && (generated[group] || []).length > 0 && !state.accents[accent];
+    const isEnabled = Boolean(state.accents[accent]) || isAutomaticHealthyBack;
+    if (isEnabled && !(state.session[group] || []).length) state.session[group] = generated[group] || [];
+    if (!isEnabled) {
+      state.session[group] = [];
+      Object.keys(state.status).forEach((key) => { if (key.startsWith(`${group}:`)) delete state.status[key]; });
+    }
+  });
+  state.session.accents = state.accents;
+  state.session.zone = state.zone;
   saveJSON(STORAGE_SESSION, state.session);
-  state.status = {};
+  persistActiveWorkout();
   saveJSON(STORAGE_STATUS, state.status);
+  render();
+}
+
+function replanUnfinishedRows(groups, zone) {
+  if (zone === "any") return;
+  groups.forEach((group) => {
+    const rows = state.session[group] || [];
+    rows.forEach((row, index) => {
+      if (state.status[slotKey(group, index)]) return;
+      const options = getSwapOptions(row.id, row.originalId, state.session.focusId || false, zone, "zone");
+      const replacement = options.find((exercise) => exercise.id !== row.id && exerciseZone(exercise) === zone)
+        || options.find((exercise) => exerciseZone(exercise) === zone);
+      if (replacement) row.id = replacement.id;
+    });
+  });
+}
+
+function applyZoneToUnfinishedBlock(group, zone) {
+  const pending = (state.session[group] || []).filter((row, index) => !state.status[slotKey(group, index)]);
+  if (!getBlockZoneAvailability(pending, state.session.focusId, zone).available) {
+    window.alert("В этой зоне нет логичной замены для каждого неотмеченного упражнения блока. Оставила текущий план без изменений.");
+    return;
+  }
+  replanUnfinishedRows([group], zone);
+  saveJSON(STORAGE_SESSION, state.session);
+  persistActiveWorkout();
   render();
 }
 
@@ -807,7 +965,7 @@ function renderAccentPicker() {
   const wrap = document.getElementById("accent-picker");
   if (!wrap) return;
   wrap.innerHTML = "";
-  [["mobility", "+ Мобильность"], ["calisthenics", "+ Калистеника"]].forEach(([name, label]) => {
+  [["mobility", "+ Мобильность"], ["calisthenics", "+ Калистеника"], ["healthyBack", "+ Здоровая спина"]].forEach(([name, label]) => {
     const button = el(`<button type="button" class="${state.accents[name] ? "selected" : ""}">${label}</button>`);
     button.addEventListener("click", () => {
       state.accents = MoyaSilaTrainingState.toggleAccent(state.accents, name);
@@ -824,8 +982,22 @@ function renderZonePicker() {
   const labels = { any: "Любая зона", dumbbells: "Гантели", landmine: "Штанга / landmine", cable: "Кабель", machines: "Тренажёры", bodyweight: "Резинка / вес тела", floor: "Коврик / роллер" };
   wrap.innerHTML = "";
   Object.entries(labels).forEach(([zone, label]) => {
-    const button = el(`<button type="button" class="${zone === state.zone ? "selected" : ""}">${label}</button>`);
-    button.addEventListener("click", () => { state.zone = zone; saveJSON(STORAGE_ZONE, zone); regenerateForOptions(); });
+    const availability = zone === "any" ? { available: true } : getFocusZoneAvailability(state.session.focusId, zone);
+    const unavailable = !availability.available;
+    const hint = unavailable ? `Недостаточно вариантов для 3 основных и 3 ротаций (${availability.count || 0}/6)` : "";
+    const button = el(`<button type="button" class="${zone === state.zone ? "selected" : ""}" ${unavailable ? "disabled" : ""} title="${hint}">${label}</button>`);
+    button.addEventListener("click", () => {
+      if (unavailable) return;
+      state.zone = zone;
+      // The top filter plans the full strength part. Other blocks keep their
+      // own nearby selector, so a core or accent never changes unexpectedly.
+      replanUnfinishedRows(["anchors", "rotation"], zone);
+      saveJSON(STORAGE_ZONE, zone);
+      state.session.zone = zone;
+      saveJSON(STORAGE_SESSION, state.session);
+      persistActiveWorkout();
+      render();
+    });
     wrap.appendChild(button);
   });
 }
@@ -842,8 +1014,8 @@ function exerciseCard(block, row, index) {
   const status = state.status[key];
   const isExpanded = state.expanded === key;
   const isSwapOpen = state.swapOpenKey === key;
-  const isPrepSlot = block.group === "warmup" || block.group === "cooldown";
-  const accentMap = { warmup: "warmup", core: "core", cooldown: "cooldown", rotation: "rotation", mobilityAccent: "cooldown", calisthenics: "rotation", anchors: "main" };
+  const isPrepSlot = ["prep", "activation", "cooldown"].includes(block.group);
+  const accentMap = { prep: "warmup", activation: "warmup", core: "core", cooldown: "cooldown", healthyBack: "main", rotation: "rotation", mobilityAccent: "main", calisthenics: "rotation", anchors: "main" };
   const accentClass = accentMap[block.group] || "main";
   const wasSwapped = row.originalId && row.originalId !== row.id;
 
@@ -890,10 +1062,10 @@ function exerciseCard(block, row, index) {
             <p class="ex-muscle">🎯 Работает: <strong>${GROUP_LABELS[exercise.tag] || exercise.tag}</strong></p>
             <p class="ex-cue">${exercise.cue}</p>
             <p class="ex-weight-guide">${row.weightGuide || "Вес: выбери тот, с которым техника остаётся чистой."}</p>
-            ${last ? `<p class="ex-last">Прошлый раз: <strong>${last.weight ? last.weight + " кг" : ""}${last.weight && last.reps ? " × " : ""}${last.reps || ""}</strong> — подставила ниже, можно просто подтвердить или поправить</p>` : ""}
+            ${last ? `<p class="ex-last">Прошлый раз: <strong>${safeText(last.weight ? last.weight + " кг" : "")}${last.weight && last.reps ? " × " : ""}${safeText(last.reps || "")}</strong> — подставила ниже, можно просто подтвердить или поправить</p>` : ""}
             <div class="ex-log">
-              <input type="text" inputmode="decimal" placeholder="кг" class="log-weight" value="${last && last.weight ? last.weight : ""}" />
-              <input type="text" inputmode="numeric" placeholder="повторы" class="log-reps" value="${last && last.reps ? last.reps : ""}" />
+              <input type="text" inputmode="decimal" placeholder="кг" class="log-weight" value="${safeText(last && last.weight ? last.weight : "")}" />
+              <input type="text" inputmode="numeric" placeholder="повторы" class="log-reps" value="${safeText(last && last.reps ? last.reps : "")}" />
               <button type="button" class="log-save">Записать</button>
             </div>
             ${timerHtml}
@@ -915,7 +1087,7 @@ function exerciseCard(block, row, index) {
 
     if (isSwapOpen) {
       const chipsWrap = detail.querySelector(".swap-chips");
-      const options = getSwapOptions(row.id, row.originalId, isPrepSlot, state.blockZones[block.group] || "any");
+      const options = getSwapOptions(row.id, row.originalId, state.session.focusId || isPrepSlot, state.zone, "all");
       options.forEach((opt) => {
         const isCurrent = opt.id === row.id;
         const isOriginal = opt.id === row.originalId && row.originalId !== row.id;
@@ -943,7 +1115,10 @@ function quickChecklistCard(block, row, index) {
   const exercise = EXERCISES[row.id];
   const key = slotKey(block.group, index);
   const done = state.status[key] === "done";
-  const card = el(`<button type="button" class="quick-check ${done ? "done" : ""}"><span>${done ? "✓" : ""}</span><strong>${exercise.nameEn}</strong><i>⧉</i></button>`);
+  const target = GROUP_LABELS[exercise.tag] || exercise.tag;
+  const tool = exercise.equipment === "roller" ? "РОЛЛЕР" : exercise.equipment === "band" ? "РЕЗИНКА" : "КОВРИК";
+  const category = block.group === "prep" ? "СУСТАВЫ" : block.group === "activation" ? "АКТИВАЦИЯ" : block.group === "healthyBack" ? "ОСАНКА" : block.group === "cooldown" ? "РАССЛАБЛЕНИЕ" : "МОБИЛЬНОСТЬ";
+  const card = el(`<button type="button" class="quick-check quick-${block.group} ${done ? "done" : ""}"><span>${done ? "✓" : ""}</span><strong>${exercise.nameEn}</strong><small><b>${category}</b> · ${target} · ${tool}</small><i>⧉</i></button>`);
   card.addEventListener("click", () => setStatus(key, "done"));
   card.querySelector("i").addEventListener("click", (event) => { event.stopPropagation(); copyName(exercise.nameEn, event.currentTarget); });
   return card;
@@ -952,24 +1127,31 @@ function quickChecklistCard(block, row, index) {
 function renderBlocks() {
   const wrap = document.getElementById("blocks");
   wrap.innerHTML = "";
+  if (state.session.zoneWarning) wrap.appendChild(el(`<p class="swap-empty">${safeText(state.session.zoneWarning)}</p>`));
   BLOCKS.forEach((block) => {
     const rows = state.session[block.group] || [];
     if (!rows.length) return;
+    const blockHints = { prep: "коврик · суставы и амплитуда", activation: "коврик · лопатки, таз и контроль", healthyBack: "осанка и грудной отдел", mobilityAccent: "дополнительная подвижность", cooldown: "роллер и спокойная растяжка" };
     const section = el(`
       <section class="block ${block.cls}">
-        <div class="block-head"><span class="block-dot"></span><strong>${block.title}</strong><span>${rows.length} шт</span></div>
+        <div class="block-head"><span class="block-dot"></span><strong>${block.title}</strong><span>${rows.length} шт</span>${blockHints[block.group] ? `<em>${blockHints[block.group]}</em>` : ""}</div>
         <div class="block-list"></div>
       </section>
     `);
     const list = section.querySelector(".block-list");
-    if (["warmup", "cooldown", "mobilityAccent"].includes(block.group)) {
+    if (["prep", "activation", "cooldown"].includes(block.group)) {
       section.querySelector(".block-head").insertAdjacentHTML("beforeend", `<small>Отметь то, что сделала</small>`);
       rows.forEach((row, i) => list.appendChild(quickChecklistCard(block, row, i)));
     } else {
-      if (["anchors", "rotation", "core", "calisthenics"].includes(block.group)) {
-        const select = el(`<select class="block-zone" aria-label="Зона для замен в блоке"><option value="any">Любая зона</option><option value="dumbbells">Гантели</option><option value="landmine">Штанга / landmine</option><option value="cable">Кабель</option><option value="machines">Тренажёры</option><option value="bodyweight">Резинка / вес тела</option><option value="floor">Коврик / роллер</option></select>`);
-        select.value = state.blockZones[block.group] || "any";
-        select.addEventListener("change", () => { state.blockZones[block.group] = select.value; });
+      if (["anchors", "rotation", "core", "healthyBack", "mobilityAccent", "calisthenics"].includes(block.group)) {
+        const pending = rows.filter((row, index) => !state.status[slotKey(block.group, index)]);
+        const zones = [["dumbbells", "Гантели"], ["landmine", "Штанга / landmine"], ["cable", "Кабель"], ["machines", "Тренажёры"], ["bodyweight", "Резинка / вес тела"], ["floor", "Коврик / роллер"]];
+        const options = zones.map(([zone, label]) => {
+          const available = getBlockZoneAvailability(pending, state.session.focusId, zone).available;
+          return `<option value="${zone}" ${available ? "" : "disabled"}>${label}${available ? "" : " · нет полной замены"}</option>`;
+        }).join("");
+        const select = el(`<select class="block-zone" aria-label="Перестроить только неотмеченные упражнения этого блока"><option value="">Зона для неотмеченных…</option>${options}</select>`);
+        select.addEventListener("change", () => { if (select.value) applyZoneToUnfinishedBlock(block.group, select.value); });
         section.querySelector(".block-head").appendChild(select);
       }
       if (rows.some((row) => row.format === "circuit")) {
@@ -991,7 +1173,7 @@ function renderUndoBanner() {
   }
   wrap.classList.remove("hidden");
   wrap.innerHTML = `
-    <span>Тренировка «${state.lastUndo.session.letter}» отмечена завершённой.</span>
+    <span>Тренировка «${safeText(state.lastUndo.session.letter)}» отмечена завершённой.</span>
     <div class="undo-actions">
       <button type="button" class="undo-btn">Отменить, вернуться →</button>
       <button type="button" class="undo-dismiss" aria-label="Скрыть">×</button>
@@ -1016,13 +1198,13 @@ function renderHistory() {
       <div class="history-item">
         <div class="h-row">
           <button type="button" class="h-info">
-            <span class="h-letter">${entry.letter}</span> · ${entry.label}<br />
+            <span class="h-letter">${safeText(entry.letter)}</span> · ${safeText(entry.label)}<br />
             <span class="h-sub">${d.getDate()} ${MONTHS_RU_FULL[d.getMonth()]} · ${entry.done}/${entry.total}${entry.skipped ? ", пропущено " + entry.skipped : ""} · открыть отчёт →</span>
           </button>
           <button type="button" class="h-delete" title="Удалить запись">🗑</button>
         </div>
         <label class="h-date-label">Дата <input type="date" value="${dateKey(d)}" max="${dateKey(new Date())}" /></label>
-        <textarea class="h-note-input" placeholder="Добавить заметку…">${entry.note || ""}</textarea>
+        <textarea class="h-note-input" placeholder="Добавить заметку…">${safeText(entry.note || "")}</textarea>
       </div>
     `);
     item.querySelector(".h-info").addEventListener("click", () => openReport(entry.id));
@@ -1081,8 +1263,8 @@ function renderReportView() {
       return `
         <div class="report-ex ${statusCls}">
           <span class="report-ex-status">${statusIcon}</span>
-          <span class="report-ex-name">${ex.name}<small>${ex.slotTitle}</small></span>
-          ${weightText ? `<span class="report-ex-weight">${weightText}</span>` : ""}
+          <span class="report-ex-name">${safeText(ex.name)}<small>${safeText(ex.slotTitle)}</small></span>
+          ${weightText ? `<span class="report-ex-weight">${safeText(weightText)}</span>` : ""}
         </div>
       `;
     })
@@ -1090,8 +1272,8 @@ function renderReportView() {
 
   wrap.innerHTML = `
     <div class="report-head">
-      <span class="hero-letter" style="background:var(--day-accent-bg); color:var(--day-accent);">${entry.letter}</span>
-      <h2>${entry.label}</h2>
+      <span class="hero-letter" style="background:var(--day-accent-bg); color:var(--day-accent);">${safeText(entry.letter)}</span>
+      <h2>${safeText(entry.label)}</h2>
       <p class="report-meta">${d.getDate()} ${MONTHS_RU_FULL[d.getMonth()]} ${d.getFullYear()} · ${MODE_LABEL[entry.mode] || entry.mode} · вайб «${VIBE_LABEL[entry.vibe] || entry.vibe}»</p>
       <div class="report-stats">
         <div><strong>${entry.done}</strong><span>сделано</span></div>
@@ -1099,7 +1281,7 @@ function renderReportView() {
         <div><strong>${entry.total}</strong><span>всего</span></div>
       </div>
     </div>
-    ${entry.note ? `<p class="report-note">📝 ${entry.note}</p>` : ""}
+    ${entry.note ? `<p class="report-note">📝 ${safeText(entry.note)}</p>` : ""}
     <div class="report-exercises">${exercisesHtml || '<p class="history-empty">Список упражнений не сохранён для этой записи.</p>'}</div>
     <button type="button" class="report-delete" id="report-delete-btn">Удалить эту запись</button>
   `;
@@ -1207,6 +1389,17 @@ function render() {
   renderHistory();
   renderAnalytics();
   renderReportView();
+  renderFinishReminder();
+}
+
+function renderFinishReminder() {
+  if (!state.activeWorkout || !MoyaSilaTrainingState.shouldOfferFinishReminder(state.activeWorkout, state.status, allTrackableRows().length, new Date())) return;
+  const note = document.getElementById("undo-banner");
+  if (!note || state.lastUndo) return;
+  note.classList.remove("hidden");
+  note.innerHTML = `<span>Тренировка от ${state.activeWorkout.plannedDate} почти завершена. Отметить её завершённой?</span><div class="undo-actions"><button type="button" class="finish-old">Завершить</button><button type="button" class="continue-old">Продолжить</button></div>`;
+  note.querySelector(".finish-old").addEventListener("click", finishSession);
+  note.querySelector(".continue-old").addEventListener("click", () => showView("workout"));
 }
 
 function initFinishButton() {
@@ -1259,6 +1452,13 @@ function initSplash() {
   if (!splash) return;
 
   if (dateEl) dateEl.textContent = formatDate();
+  if (state.activeWorkout) {
+    splash.classList.add("splash-hidden");
+    document.body.classList.remove("splash-open");
+    state.view = "workout";
+    showView("workout");
+    return;
+  }
   if (nextEl) {
     nextEl.innerHTML = `Сегодня можно выбрать: <strong>низ, верх, мобильность или всё тело</strong>`;
   }
@@ -1288,7 +1488,7 @@ function withTransition(mutateFn) {
 
 document.addEventListener("DOMContentLoaded", () => {
   const sessionDate = document.getElementById("session-date");
-  if (sessionDate) sessionDate.value = dateKey(new Date());
+  if (sessionDate) sessionDate.value = state.activeWorkout ? state.activeWorkout.plannedDate : dateKey(new Date());
   render();
   initFinishButton();
   initExtras();
